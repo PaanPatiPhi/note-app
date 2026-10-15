@@ -152,7 +152,7 @@ func (s *Service) CaptureFromLine(ctx context.Context, lineUserID, displayName, 
 		if result := validateOrResult(title); result != nil {
 			return result, nil
 		}
-		n, err := s.noteRepo.SaveChecklist(ctx, u.ID, &title, items)
+		n, err := s.noteRepo.SaveChecklist(ctx, u.ID, &title, items, NoteSourceLine)
 		if err != nil {
 			return nil, fmt.Errorf("save checklist: %w", err)
 		}
@@ -162,7 +162,7 @@ func (s *Service) CaptureFromLine(ctx context.Context, lineUserID, displayName, 
 		if result := validateOrResult(trimmed); result != nil {
 			return result, nil
 		}
-		n := &Note{UserID: u.ID, Content: &trimmed, Type: NoteTypeNote}
+		n := &Note{UserID: u.ID, Content: &trimmed, Type: NoteTypeNote, Source: NoteSourceLine}
 		if err := s.noteRepo.SaveNote(ctx, n); err != nil {
 			return nil, fmt.Errorf("save note: %w", err)
 		}
@@ -361,7 +361,7 @@ func (s *Service) CreateFromAPI(ctx context.Context, userID, lineUserID, display
 		}
 	}
 	if len(cleanItems) > 0 {
-		n, err := s.noteRepo.SaveChecklist(ctx, uid, &trimmed, cleanItems)
+		n, err := s.noteRepo.SaveChecklist(ctx, uid, &trimmed, cleanItems, NoteSourceWeb)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -371,7 +371,7 @@ func (s *Service) CreateFromAPI(ctx context.Context, userID, lineUserID, display
 		}
 		return n, noteItems, nil
 	}
-	n := &Note{UserID: uid, Content: &trimmed, Type: NoteTypeNote}
+	n := &Note{UserID: uid, Content: &trimmed, Type: NoteTypeNote, Source: NoteSourceWeb}
 	if err := s.noteRepo.SaveNote(ctx, n); err != nil {
 		return nil, nil, fmt.Errorf("save note: %w", err)
 	}

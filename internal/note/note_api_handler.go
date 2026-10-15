@@ -44,13 +44,16 @@ type toggleItemRequest struct {
 }
 
 type noteDTO struct {
-	ID        string    `json:"id"`
-	Content   string    `json:"content"`
-	Type      string    `json:"type"`
-	IsDone    bool      `json:"is_done"`
-	ImageURL  string    `json:"image_url,omitempty"`
-	CreatedAt time.Time `json:"created_at"`
-	Items     []itemDTO `json:"items,omitempty"`
+	ID        string     `json:"id"`
+	Content   string     `json:"content"`
+	Type      string     `json:"type"`
+	IsDone    bool       `json:"is_done"`
+	ImageURL  string     `json:"image_url,omitempty"`
+	DueDate   *time.Time `json:"due_date,omitempty"`
+	RemindAt  *time.Time `json:"remind_at,omitempty"`
+	Source    string     `json:"source"`
+	CreatedAt time.Time  `json:"created_at"`
+	Items     []itemDTO  `json:"items,omitempty"`
 }
 
 type itemDTO struct {
@@ -60,7 +63,10 @@ type itemDTO struct {
 }
 
 func toNoteDTO(n *Note, items []*NoteItem) noteDTO {
-	dto := noteDTO{ID: n.ID, Type: string(n.Type), IsDone: n.IsDone, CreatedAt: n.CreatedAt}
+	dto := noteDTO{
+		ID: n.ID, Type: string(n.Type), IsDone: n.IsDone, CreatedAt: n.CreatedAt,
+		DueDate: n.DueDate, RemindAt: n.RemindAt, Source: string(n.Source),
+	}
 	if n.Content != nil {
 		dto.Content = *n.Content
 	}
@@ -100,7 +106,7 @@ func parseTypeQuery(c *gin.Context) (*NoteType, bool) {
 		return nil, true
 	}
 	switch NoteType(raw) {
-	case NoteTypeNote, NoteTypeTodo, NoteTypeChecklist:
+	case NoteTypeNote, NoteTypeTodo, NoteTypeChecklist, NoteTypeReminder:
 		t := NoteType(raw)
 		return &t, true
 	default:

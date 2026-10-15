@@ -18,13 +18,16 @@ func NewRepository(pool *pgxpool.Pool) *Repository {
 }
 
 func (r *Repository) SaveNote(ctx context.Context, n *Note) error {
+	if n.Source == "" {
+		n.Source = NoteSourceLine
+	}
 	query := `
-		INSERT INTO notes (user_id, content, type, is_done, due_date, image_url)
-		VALUES ($1, $2, $3, $4, $5, $6)
+		INSERT INTO notes (user_id, content, type, is_done, due_date, image_url, remind_at, source)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 		RETURNING id, created_at, updated_at
 	`
 	err := r.pool.QueryRow(ctx, query,
-		n.UserID, n.Content, n.Type, n.IsDone, n.DueDate, n.ImageURL,
+		n.UserID, n.Content, n.Type, n.IsDone, n.DueDate, n.ImageURL, n.RemindAt, n.Source,
 	).Scan(&n.ID, &n.CreatedAt, &n.UpdatedAt)
 	if err != nil {
 		return fmt.Errorf("save note: %w", err)
@@ -32,21 +35,24 @@ func (r *Repository) SaveNote(ctx context.Context, n *Note) error {
 	return nil
 }
 
-func (r *Repository) SaveChecklist(ctx context.Context, userID string, content *string, items []string) (*Note, error) {
+func (r *Repository) SaveChecklist(ctx context.Context, userID string, content *string, items []string, source NoteSource) (*Note, error) {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback(ctx)
 
-	n := &Note{UserID: userID, Content: content, Type: NoteTypeChecklist}
+	if source == "" {
+		source = NoteSourceLine
+	}
+	n := &Note{UserID: userID, Content: content, Type: NoteTypeChecklist, Source: source}
 
 	noteQuery := `
-		INSERT INTO notes (user_id, content, type)
-		VALUES ($1, $2, $3)
+		INSERT INTO notes (user_id, content, type, source)
+		VALUES ($1, $2, $3, $4)
 		RETURNING id, created_at, updated_at
 	`
-	err = tx.QueryRow(ctx, noteQuery, n.UserID, n.Content, n.Type).
+	err = tx.QueryRow(ctx, noteQuery, n.UserID, n.Content, n.Type, n.Source).
 		Scan(&n.ID, &n.CreatedAt, &n.UpdatedAt)
 	if err != nil {
 		return nil, fmt.Errorf("insert note: %w", err)
@@ -66,15 +72,11 @@ func (r *Repository) SaveChecklist(ctx context.Context, userID string, content *
 }
 
 func (r *Repository) FindLatestByUser(ctx context.Context, userID string) (*Note, error) {
-	n := &Note{}
 	query := `
-		SELECT id, user_id, content, type, is_done, due_date, image_url, created_at, updated_at
+		SELECT ` + noteColumns + `
 		FROM notes WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1
 	`
-	err := r.pool.QueryRow(ctx, query, userID).Scan(
-		&n.ID, &n.UserID, &n.Content, &n.Type, &n.IsDone,
-		&n.DueDate, &n.ImageURL, &n.CreatedAt, &n.UpdatedAt,
-	)
+	n, err := scanNote(r.pool.QueryRow(ctx, query, userID))
 	if err != nil {
 		return nil, fmt.Errorf("find latest note: %w", err)
 	}
@@ -126,7 +128,7 @@ func (r *Repository) FindByUserAndDate(ctx context.Context, userID string, date 
 	typeClause, args := buildTypeFilter(typeFilter, args)
 
 	query := fmt.Sprintf(`
-		SELECT id, user_id, content, type, is_done, due_date, image_url, created_at, updated_at
+		SELECT `+noteColumns+`
 		FROM notes
 		WHERE user_id = $1
 		  AND (created_at AT TIME ZONE 'Asia/Bangkok')::date = $2::date%s
@@ -144,7 +146,7 @@ func (r *Repository) FindByUserAndDate(ctx context.Context, userID string, date 
 // SearchByUser ค้นหาโน้ตด้วย keyword — ใช้กับคำสั่ง LINE "หา" เท่านั้น (ฝั่ง API ใช้ FindFeed แทน)
 func (r *Repository) SearchByUser(ctx context.Context, userID, query string) ([]*Note, error) {
 	q := `
-		SELECT id, user_id, content, type, is_done, due_date, image_url, created_at, updated_at
+		SELECT ` + noteColumns + `
 		FROM notes
 		WHERE user_id = $1 AND content ILIKE '%' || $2 || '%'
 		ORDER BY created_at DESC
@@ -204,7 +206,7 @@ func (r *Repository) FindFeed(ctx context.Context, q FeedQuery) ([]*Note, error)
 	limitPh := fmt.Sprintf("$%d", len(args))
 
 	query := fmt.Sprintf(`
-		SELECT id, user_id, content, type, is_done, due_date, image_url, created_at, updated_at
+		SELECT `+noteColumns+`
 		FROM notes
 		WHERE %s
 		ORDER BY created_at %s
@@ -277,15 +279,11 @@ func (r *Repository) DeleteByUserAndID(ctx context.Context, userID, noteID strin
 }
 
 func (r *Repository) FindByUserAndID(ctx context.Context, userID, noteID string) (*Note, error) {
-	n := &Note{}
 	q := `
-		SELECT id, user_id, content, type, is_done, due_date, image_url, created_at, updated_at
+		SELECT ` + noteColumns + `
 		FROM notes WHERE id = $1 AND user_id = $2
 	`
-	err := r.pool.QueryRow(ctx, q, noteID, userID).Scan(
-		&n.ID, &n.UserID, &n.Content, &n.Type, &n.IsDone,
-		&n.DueDate, &n.ImageURL, &n.CreatedAt, &n.UpdatedAt,
-	)
+	n, err := scanNote(r.pool.QueryRow(ctx, q, noteID, userID))
 	if err != nil {
 		return nil, fmt.Errorf("find note: %w", err)
 	}
@@ -347,6 +345,24 @@ func (r *Repository) FindItemByPosition(ctx context.Context, noteID string, posi
 	return it, nil
 }
 
+// noteColumns คือคอลัมน์ของ notes ที่ SELECT ทุกครั้ง ต้องเรียงตรงกับ scanNote
+const noteColumns = `id, user_id, content, type, is_done, due_date, image_url,
+		remind_at, reminded_at, source, created_at, updated_at`
+
+// scanNote scan หนึ่งแถวที่ SELECT ด้วย noteColumns
+func scanNote(row interface{ Scan(...any) error }) (*Note, error) {
+	n := &Note{}
+	err := row.Scan(
+		&n.ID, &n.UserID, &n.Content, &n.Type, &n.IsDone,
+		&n.DueDate, &n.ImageURL, &n.RemindAt, &n.RemindedAt, &n.Source,
+		&n.CreatedAt, &n.UpdatedAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return n, nil
+}
+
 // scanNotes helper รวม logic การ scan rows -> []*Note ใช้ร่วมกันหลายฟังก์ชัน
 func scanNotes(rows interface {
 	Next() bool
@@ -355,11 +371,7 @@ func scanNotes(rows interface {
 }) ([]*Note, error) {
 	var notes []*Note
 	for rows.Next() {
-		n := &Note{}
-		err := rows.Scan(
-			&n.ID, &n.UserID, &n.Content, &n.Type, &n.IsDone,
-			&n.DueDate, &n.ImageURL, &n.CreatedAt, &n.UpdatedAt,
-		)
+		n, err := scanNote(rows)
 		if err != nil {
 			return nil, fmt.Errorf("scan note: %w", err)
 		}

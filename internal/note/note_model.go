@@ -8,6 +8,16 @@ const (
 	NoteTypeNote      NoteType = "note"
 	NoteTypeTodo      NoteType = "todo"
 	NoteTypeChecklist NoteType = "checklist"
+	NoteTypeReminder  NoteType = "reminder"
+)
+
+// NoteSource บอกว่าโน้ตถูกสร้างจากช่องทางไหน (ตรงกับ CHECK constraint notes_source_check)
+type NoteSource string
+
+const (
+	NoteSourceLine NoteSource = "line"
+	NoteSourceWeb  NoteSource = "web"
+	NoteSourceAI   NoteSource = "ai"
 )
 
 type User struct {
@@ -18,15 +28,18 @@ type User struct {
 }
 
 type Note struct {
-	ID        string    `db:"id"`
-	UserID    string    `db:"user_id"`
-	Content   *string   `db:"content"` // pointer เพราะ nullable
-	Type      NoteType  `db:"type"`
-	IsDone    bool      `db:"is_done"`
-	DueDate   *time.Time `db:"due_date"`
-	ImageURL  *string   `db:"image_url"`
-	CreatedAt time.Time `db:"created_at"`
-	UpdatedAt time.Time `db:"updated_at"`
+	ID         string     `db:"id"`
+	UserID     string     `db:"user_id"`
+	Content    *string    `db:"content"` // pointer เพราะ nullable
+	Type       NoteType   `db:"type"`
+	IsDone     bool       `db:"is_done"`
+	DueDate    *time.Time `db:"due_date"`
+	ImageURL   *string    `db:"image_url"`
+	RemindAt   *time.Time `db:"remind_at"`   // เวลาที่ต้องส่งเตือน (เฉพาะ type reminder)
+	RemindedAt *time.Time `db:"reminded_at"` // เวลาที่ส่งเตือนไปแล้ว; nil = ยังไม่ส่ง
+	Source     NoteSource `db:"source"`      // ว่างตอน insert = ใช้ NoteSourceLine
+	CreatedAt  time.Time  `db:"created_at"`
+	UpdatedAt  time.Time  `db:"updated_at"`
 }
 
 type NoteItem struct {
