@@ -6,8 +6,10 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"runtime/debug"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -15,10 +17,21 @@ import (
 	"github.com/line/line-bot-sdk-go/v8/linebot/webhook"
 )
 
+const (
+	// จำนวน webhook callback ที่ประมวลผลพร้อมกันได้สูงสุด
+	maxConcurrentCallbacks = 16
+
+	eventTimeout  = 10 * time.Second
+	dedupeTimeout = 3 * time.Second
+)
+
 type Handler struct {
 	service       *Service
 	bot           *messaging_api.MessagingApiAPI
 	channelSecret string
+
+	wg  sync.WaitGroup
+	sem chan struct{}
 }
 
 func NewHandler(service *Service, bot *messaging_api.MessagingApiAPI, channelSecret string) *Handler {
@@ -26,9 +39,12 @@ func NewHandler(service *Service, bot *messaging_api.MessagingApiAPI, channelSec
 		service:       service,
 		bot:           bot,
 		channelSecret: channelSecret,
+		sem:           make(chan struct{}, maxConcurrentCallbacks),
 	}
 }
 
+// HandleWebhook ตรวจ signature แล้วตอบ 200 ทันที ส่วนการประมวลผล event ทำใน goroutine
+// เพื่อไม่ให้ LINE timeout/redeliver เวลางานช้า (เช่นเรียก AI)
 func (h *Handler) HandleWebhook(c *gin.Context) {
 	cb, err := webhook.ParseRequest(h.channelSecret, c.Request)
 	if err != nil {
@@ -37,20 +53,92 @@ func (h *Handler) HandleWebhook(c *gin.Context) {
 		return
 	}
 
-	for _, event := range cb.Events {
-		h.handleEvent(c.Request.Context(), event)
+	if len(cb.Events) > 0 {
+		h.wg.Add(1)
+		go h.processEvents(cb.Events)
 	}
 
 	c.Status(http.StatusOK)
 }
 
+// Wait รอให้ event ที่กำลังประมวลผลอยู่เสร็จ หรือจน ctx หมดเวลา
+// ต้องเรียกหลัง http.Server.Shutdown แล้ว (ไม่มี request ใหม่เข้ามา Add อีก)
+func (h *Handler) Wait(ctx context.Context) error {
+	done := make(chan struct{})
+	go func() {
+		h.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// processEvents ประมวลผล event ใน callback เดียวกันตามลำดับ
+// (เช่น "ซื้อนม" ตามด้วย "นม เสร็จ" ต้องไม่สลับกัน)
+func (h *Handler) processEvents(events []webhook.EventInterface) {
+	defer h.wg.Done()
+
+	h.sem <- struct{}{}
+	defer func() { <-h.sem }()
+
+	for _, event := range events {
+		h.safeHandleEvent(event)
+	}
+}
+
+func (h *Handler) safeHandleEvent(event webhook.EventInterface) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("panic ระหว่างประมวลผล event: %v\n%s", r, debug.Stack())
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), eventTimeout)
+	defer cancel()
+
+	h.handleEvent(ctx, event)
+}
+
 func (h *Handler) handleEvent(ctx context.Context, event webhook.EventInterface) {
+	if id := webhookEventID(event); id != "" && !h.markNew(ctx, id) {
+		log.Println("ข้าม event ที่เคยประมวลผลแล้ว:", id)
+		return
+	}
+
 	switch e := event.(type) {
 	case webhook.MessageEvent:
 		h.handleMessageEvent(ctx, e)
 	case webhook.PostbackEvent:
 		h.handlePostbackEvent(ctx, e)
 	}
+}
+
+// markNew คืน true ถ้า event นี้ควรถูกประมวลผล
+// ถ้า DB สำหรับ dedupe มีปัญหา ให้ประมวลผลต่อ (ยอมซ้ำดีกว่าหายเงียบ)
+func (h *Handler) markNew(ctx context.Context, webhookEventID string) bool {
+	ctx, cancel := context.WithTimeout(ctx, dedupeTimeout)
+	defer cancel()
+
+	isNew, err := h.service.MarkEventProcessed(ctx, webhookEventID)
+	if err != nil {
+		log.Println("dedupe webhook event ล้มเหลว:", err)
+		return true
+	}
+	return isNew
+}
+
+func webhookEventID(event webhook.EventInterface) string {
+	switch e := event.(type) {
+	case webhook.MessageEvent:
+		return e.WebhookEventId
+	case webhook.PostbackEvent:
+		return e.WebhookEventId
+	}
+	return ""
 }
 
 func (h *Handler) handleMessageEvent(ctx context.Context, msgEvent webhook.MessageEvent) {
@@ -64,14 +152,6 @@ func (h *Handler) handleMessageEvent(ctx context.Context, msgEvent webhook.Messa
 		log.Println("event ไม่ได้มาจาก user เดี่ยว ข้าม")
 		return
 	}
-
-	if msgEvent.DeliveryContext != nil && msgEvent.DeliveryContext.IsRedelivery {
-		log.Println("ข้าม redelivered event:", msgEvent.WebhookEventId)
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
 
 	result, err := h.service.CaptureFromLine(ctx, source.UserId, "", textMsg.Text)
 	if err != nil {
@@ -94,14 +174,6 @@ func (h *Handler) handlePostbackEvent(ctx context.Context, e webhook.PostbackEve
 		log.Println("postback ไม่ได้มาจาก user เดี่ยว ข้าม")
 		return
 	}
-
-	if e.DeliveryContext != nil && e.DeliveryContext.IsRedelivery {
-		log.Println("ข้าม redelivered postback:", e.WebhookEventId)
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
 
 	values, err := url.ParseQuery(e.Postback.Data)
 	if err != nil {

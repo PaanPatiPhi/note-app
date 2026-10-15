@@ -2,9 +2,13 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log"
+	"net/http"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/gin-contrib/cors"
@@ -114,7 +118,33 @@ func main() {
 	subscriptionHandler.RegisterRoutes(protectedAPI)
 	adminHandler.RegisterRoutes(protectedAPI)
 
-	r.Run()
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+	srv := &http.Server{Addr: ":" + port, Handler: r}
+
+	go func() {
+		log.Println("server listening on", srv.Addr)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatal("server ล้มเหลว:", err)
+		}
+	}()
+
+	// Graceful shutdown: หยุดรับ request ใหม่ก่อน แล้วรอ webhook event ที่ค้างอยู่ให้เสร็จ
+	sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	<-sigCtx.Done()
+	log.Println("กำลังปิด server...")
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Println("shutdown http server ล้มเหลว:", err)
+	}
+	if err := webhookHandler.Wait(shutdownCtx); err != nil {
+		log.Println("รอ webhook event ค้างไม่ทัน:", err)
+	}
 }
 
 // newPool สร้าง pgx pool ที่ปิด prepared statement caching (ใช้ simple protocol แทน)

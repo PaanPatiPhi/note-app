@@ -370,29 +370,19 @@ func scanNotes(rows interface {
 
 // TryMarkEventProcessed ตรวจสอบและ mark webhook event ID ว่าถูกประมวลแล้ว
 // คืน (isNew bool, error) - isNew=true คือ event ใหม่ ยังไม่เคยถูก mark
-// ใช้ INSERT ... ON CONFLICT DO NOTHING ของ dedup ที่ทำงานไดแม่แม้กับทุก database
+// ใช้ INSERT ... ON CONFLICT DO NOTHING แล้วดู RowsAffected ในคำสั่งเดียว (atomic):
+// 1 = insert สำเร็จ (event ใหม่), 0 = ชน unique key (เคยประมวลแล้ว)
 func (r *Repository) TryMarkEventProcessed(ctx context.Context, webhookEventID string) (bool, error) {
 	query := `
 		INSERT INTO webhook_events (webhook_event_id)
 		VALUES ($1)
 		ON CONFLICT (webhook_event_id) DO NOTHING
 	`
-	_, err := r.pool.Exec(ctx, query, webhookEventID)
+	tag, err := r.pool.Exec(ctx, query, webhookEventID)
 	if err != nil {
 		return false, fmt.Errorf("mark event processed: %w", err)
 	}
-
-	// ถ้า INSERT สำเร็จ (row affected > 0) แปลว่า event ใหม่ยังไม่เคย mark
-	// ถ้า row affected = 0 แปลว่า event ถูก mark ไปแล้ว (conflict)
-	// แต่วิธีของ PostgreSQL ON CONFLICT DO NOT ไม่บอกว่าได้ insert หรือ conflict
-	// ดังนั้นใช้ SELECT เช็คว่า event มีอยู่แล้วเพื่อบอกค่า isNew
-	var exists bool
-	err = r.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM webhook_events WHERE webhook_event_id = $1)`, webhookEventID).Scan(&exists)
-	if err != nil {
-		return false, fmt.Errorf("check event exists: %w", err)
-	}
-
-	return !exists, nil
+	return tag.RowsAffected() == 1, nil
 }
 
 

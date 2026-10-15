@@ -445,6 +445,11 @@ func (s *Service) SetItemDoneFromAPI(ctx context.Context, userID, lineUserID, di
 	return s.noteRepo.SetItemDone(ctx, uid, itemID, done)
 }
 
+// MarkEventProcessed คืน true ถ้า webhook event นี้ยังไม่เคยถูกประมวลผล (และ mark ไว้แล้ว)
+func (s *Service) MarkEventProcessed(ctx context.Context, webhookEventID string) (bool, error) {
+	return s.noteRepo.TryMarkEventProcessed(ctx, webhookEventID)
+}
+
 // ToggleItemFromPostback ใช้ตอนรับ Postback จาก Quick Reply ที่ user กดเลือก (กรณี
 // fuzzyToggleItem เจอกำกวมแล้วส่งตัวเลือกไปก่อนหน้า)
 func (s *Service) ToggleItemFromPostback(ctx context.Context, lineUserID, itemID string, done bool) (*CommandResult, error) {
