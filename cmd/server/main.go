@@ -1,59 +1,129 @@
 package main
 
 import (
+	"context"
 	"log"
 	"os"
+	"strings"
+	"time"
 
+	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/joho/godotenv"
-	// "github.com/line/line-bot-sdk-go/v8/linebot"
 	"github.com/line/line-bot-sdk-go/v8/linebot/messaging_api"
-	"github.com/line/line-bot-sdk-go/v8/linebot/webhook"
-	"jodjod/internal/database"
+
+	"jodjod/internal/admin"
+	"jodjod/internal/auth"
+	"jodjod/internal/feedback"
+	"jodjod/internal/note"
+	"jodjod/internal/subscription"
+	"jodjod/internal/user"
 )
 
-var bot *messaging_api.MessagingApiAPI
-
 func main() {
-	// โหลด .env (ตอน dev เท่านั้น บน production ใช้ real env vars)
 	if err := godotenv.Load(); err != nil {
 		log.Println("ไม่พบ .env ไฟล์ ใช้ env vars ของระบบแทน")
 	}
 
-	database.Connect()
-
 	channelSecret := os.Getenv("LINE_CHANNEL_SECRET")
 	channelToken := os.Getenv("LINE_CHANNEL_ACCESS_TOKEN")
+	databaseURL := os.Getenv("DATABASE_URL")
 
-	var err error
-	bot, err = messaging_api.NewMessagingApiAPI(channelToken)
+	// liffChannelID คือ Channel ID ของ LINE Login channel
+	liffChannelID := os.Getenv("LIFF_CHANNEL_ID")
+
+	// webOrigin คือ URL ของเว็บแอพ Next.js เช่น http://localhost:3000 ตอน dev
+	webOrigin := os.Getenv("WEB_ORIGIN")
+
+	if err := auth.CheckJWTConfig(); err != nil {
+		log.Fatal(err)
+	}
+
+	ctx := context.Background()
+
+	pool, err := newPool(ctx, databaseURL)
+	if err != nil {
+		log.Fatal("เชื่อมต่อ database ไม่สำเร็จ:", err)
+	}
+	defer pool.Close()
+
+	bot, err := messaging_api.NewMessagingApiAPI(channelToken)
 	if err != nil {
 		log.Fatal("สร้าง bot client ไม่สำเร็จ:", err)
 	}
 
-	r := gin.Default()
-	r.POST("/webhook", func(c *gin.Context) {
-		// ParseRequest ทำ signature verification ให้อัตโนมัติ
-		cb, err := webhook.ParseRequest(channelSecret, c.Request)
-		if err != nil {
-			log.Println("parse/verify ล้มเหลว:", err)
-			c.Status(400)
-			return
-		}
+	userRepo := user.NewRepository(pool)
+	noteRepo := note.NewRepository(pool)
+	noteService := note.NewService(noteRepo, userRepo)
 
-		for _, event := range cb.Events {
-			switch e := event.(type) {
-			case webhook.MessageEvent:
-				switch message := e.Message.(type) {
-				case webhook.TextMessageContent:
-					log.Println("ได้ข้อความ:", message.Text)
-					// TODO: เซฟลง Supabase ตรงนี้
-				}
+	webhookHandler := note.NewHandler(noteService, bot, channelSecret)
+	noteAPIHandler := note.NewAPIHandler(noteService)
+	userAPIHandler := user.NewAPIHandler(userRepo)
+	authHandler := auth.NewHandler(userRepo, liffChannelID)
+	feedbackRepo := feedback.NewRepository(pool)
+	feedbackHandler := feedback.NewHandler(feedbackRepo)
+	subscriptionRepo := subscription.NewRepository(pool)
+	subscriptionHandler := subscription.NewHandler(subscriptionRepo, userRepo)
+	adminHandler := admin.NewHandler(userRepo, feedbackRepo, subscriptionRepo, noteRepo)
+
+	r := gin.Default()
+
+	// ตั้งค่า CORS ให้รองรับทั้ง webOrigin, localhost dev และส่ง Cookie ได้
+	allowedOrigins := []string{"http://localhost:3000", "http://localhost:3001", "http://127.0.0.1:3000"}
+	if webOrigin != "" {
+		for _, o := range strings.Split(webOrigin, ",") {
+			o = strings.TrimSpace(o)
+			if o != "" {
+				allowedOrigins = append(allowedOrigins, o)
 			}
 		}
+	}
 
-		c.Status(200)
-	})
+	r.Use(cors.New(cors.Config{
+		AllowOrigins:     allowedOrigins,
+		AllowMethods:     []string{"GET", "POST", "DELETE", "PATCH", "OPTIONS"},
+		AllowHeaders:     []string{"Authorization", "Content-Type", "Cookie", "Accept", "Origin"},
+		ExposeHeaders:    []string{"Set-Cookie"},
+		AllowCredentials: true,
+		MaxAge:           12 * time.Hour,
+	}))
+
+	// Serve static uploads (เช่น รูปโปรไฟล์ avatar)
+	_ = os.MkdirAll("./uploads/avatars", 0755)
+	r.Static("/uploads", "./uploads")
+
+	// LINE webhook — ปลอดภัยด้วย signature verification ข้างใน handler เอง
+	r.POST("/webhook", webhookHandler.HandleWebhook)
+
+	// Public Auth Endpoints (ล็อกอินไม่ต้องมี token ก่อน)
+	publicAPI := r.Group("/api")
+	authHandler.RegisterPublicRoutes(publicAPI)
+
+	// Protected REST API — รองรับทั้ง Session Cookie, Bearer JWT, และ LINE ID Token (LIFF)
+	protectedAPI := r.Group("/api", auth.RequireAuth(userRepo, liffChannelID))
+	authHandler.RegisterProtectedRoutes(protectedAPI)
+	noteAPIHandler.RegisterRoutes(protectedAPI)
+	userAPIHandler.RegisterRoutes(protectedAPI)
+
+	// Feedback API — เฉพาะผู้ใช้งานที่เข้าสู่ระบบแล้วเท่านั้น
+	feedbackHandler.RegisterRoutes(protectedAPI)
+
+	// Subscription & Admin APIs
+	subscriptionHandler.RegisterRoutes(protectedAPI)
+	adminHandler.RegisterRoutes(protectedAPI)
 
 	r.Run()
+}
+
+// newPool สร้าง pgx pool ที่ปิด prepared statement caching (ใช้ simple protocol แทน)
+// จำเป็นเมื่อต่อผ่าน Supabase Transaction Pooler (PgBouncer โหมด transaction)
+func newPool(ctx context.Context, databaseURL string) (*pgxpool.Pool, error) {
+	config, err := pgxpool.ParseConfig(databaseURL)
+	if err != nil {
+		return nil, err
+	}
+	config.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
+	return pgxpool.NewWithConfig(ctx, config)
 }

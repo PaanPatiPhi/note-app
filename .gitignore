@@ -1,3 +1,28 @@
+# secrets / local config
 .env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# build output
 *.exe
+/server
+/bin/
+
+# scratch
 /tmp
+
+# user uploads (avatars)
+/uploads/
+
+# test / coverage
+*.out
+coverage.*
+
+# editor / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini
