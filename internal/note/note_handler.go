@@ -21,24 +21,39 @@ const (
 	// จำนวน webhook callback ที่ประมวลผลพร้อมกันได้สูงสุด
 	maxConcurrentCallbacks = 16
 
-	eventTimeout  = 10 * time.Second
+	// เผื่อเวลาให้ AI (หลายรอบ) + fallback ไปทาง rule-based ถ้า AI ล้ม
+	eventTimeout  = 30 * time.Second
 	dedupeTimeout = 3 * time.Second
+
+	// AI ต้องเสร็จภายในเวลานี้ เหลือเวลาใน eventTimeout ให้ fallback ตอบได้ทัน
+	aiTimeout = 20 * time.Second
+	// LINE รับค่า 5–60 วินาที (ทีละ 5); แสดงจุดสามจุดระหว่างรอ AI
+	loadingSeconds = 20
 )
+
+// Assistant คือ AI ที่แปลงข้อความอิสระเป็นการกระทำ (implement โดย internal/assistant)
+// แยกเป็น interface ที่นี่เพื่อไม่ให้ package note import assistant (assistant import note อยู่แล้ว)
+type Assistant interface {
+	// HandleLine คืนข้อความตอบกลับ; error = ไม่ได้เขียนข้อมูลใดเลย ผู้เรียก fallback ได้
+	HandleLine(ctx context.Context, userID, webhookEventID, text string) (string, error)
+}
 
 type Handler struct {
 	service       *Service
 	bot           *messaging_api.MessagingApiAPI
 	channelSecret string
+	ai            Assistant // nil = ไม่ใช้ AI ทุกข้อความไปทาง rule-based
 
 	wg  sync.WaitGroup
 	sem chan struct{}
 }
 
-func NewHandler(service *Service, bot *messaging_api.MessagingApiAPI, channelSecret string) *Handler {
+func NewHandler(service *Service, bot *messaging_api.MessagingApiAPI, channelSecret string, ai Assistant) *Handler {
 	return &Handler{
 		service:       service,
 		bot:           bot,
 		channelSecret: channelSecret,
+		ai:            ai,
 		sem:           make(chan struct{}, maxConcurrentCallbacks),
 	}
 }
@@ -153,6 +168,12 @@ func (h *Handler) handleMessageEvent(ctx context.Context, msgEvent webhook.Messa
 		return
 	}
 
+	// คำสั่งแบบเดิม (ดู/ลบ/เสร็จ 2/หา ...) ตอบทันทีไม่ต้องใช้ AI; ข้อความอื่นให้ AI ลองก่อน
+	if h.ai != nil && !IsCommand(textMsg.Text) &&
+		h.handleWithAI(ctx, source.UserId, msgEvent.WebhookEventId, msgEvent.ReplyToken, textMsg.Text) {
+		return
+	}
+
 	result, err := h.service.CaptureFromLine(ctx, source.UserId, "", textMsg.Text)
 	if err != nil {
 		log.Println("capture note ล้มเหลว:", err)
@@ -166,6 +187,43 @@ func (h *Handler) handleMessageEvent(ctx context.Context, msgEvent webhook.Messa
 	}
 
 	h.reply(ctx, msgEvent.ReplyToken, replyTextFor(result))
+}
+
+// handleWithAI ส่งข้อความให้ AI แล้วตอบกลับ คืน false ถ้า AI ใช้ไม่ได้และยังไม่ได้เขียนข้อมูล
+// (เช่น Ollama ไม่ได้เปิด) ให้ผู้เรียก fallback ไปทาง rule-based เพื่อไม่ให้ข้อความหาย
+func (h *Handler) handleWithAI(ctx context.Context, lineUserID, webhookEventID, replyToken, text string) bool {
+	userID, err := h.service.ResolveLineUser(ctx, lineUserID)
+	if err != nil {
+		log.Println("resolve user สำหรับ AI ล้มเหลว:", err)
+		return false
+	}
+
+	h.showLoading(lineUserID)
+
+	aiCtx, cancel := context.WithTimeout(ctx, aiTimeout)
+	defer cancel()
+	reply, err := h.ai.HandleLine(aiCtx, userID, webhookEventID, text)
+	if err != nil {
+		log.Println("AI ล้มเหลว ใช้ rule-based แทน:", err)
+		return false
+	}
+
+	h.reply(ctx, replyToken, reply)
+	return true
+}
+
+// showLoading แสดงจุดสามจุดในแชทระหว่างรอ AI (ล้มเหลวก็ไม่เป็นไร)
+func (h *Handler) showLoading(lineUserID string) {
+	if h.bot == nil {
+		return
+	}
+	_, err := h.bot.ShowLoadingAnimation(&messaging_api.ShowLoadingAnimationRequest{
+		ChatId:         lineUserID,
+		LoadingSeconds: loadingSeconds,
+	})
+	if err != nil {
+		log.Println("show loading animation ล้มเหลว:", err)
+	}
 }
 
 func (h *Handler) handlePostbackEvent(ctx context.Context, e webhook.PostbackEvent) {

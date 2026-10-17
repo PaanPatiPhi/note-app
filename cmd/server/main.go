@@ -19,6 +19,7 @@ import (
 	"github.com/line/line-bot-sdk-go/v8/linebot/messaging_api"
 
 	"jodjod/internal/admin"
+	"jodjod/internal/assistant"
 	"jodjod/internal/auth"
 	"jodjod/internal/feedback"
 	"jodjod/internal/note"
@@ -62,7 +63,7 @@ func main() {
 	noteRepo := note.NewRepository(pool)
 	noteService := note.NewService(noteRepo, userRepo)
 
-	webhookHandler := note.NewHandler(noteService, bot, channelSecret)
+	webhookHandler := note.NewHandler(noteService, bot, channelSecret, newAssistant(pool, noteRepo))
 	noteAPIHandler := note.NewAPIHandler(noteService)
 	userAPIHandler := user.NewAPIHandler(userRepo)
 	authHandler := auth.NewHandler(userRepo, liffChannelID)
@@ -156,4 +157,19 @@ func newPool(ctx context.Context, databaseURL string) (*pgxpool.Pool, error) {
 	}
 	config.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
 	return pgxpool.NewWithConfig(ctx, config)
+}
+// newAssistant สร้าง AI ตาม AI_PROVIDER (ollama ค่าเริ่มต้น, claude, หรือ off)
+// คืน nil ถ้าปิดหรือตั้งค่าผิด → ทุกข้อความใน LINE ใช้คำสั่งแบบเดิม
+func newAssistant(pool *pgxpool.Pool, noteRepo *note.Repository) note.Assistant {
+	if strings.EqualFold(strings.TrimSpace(os.Getenv("AI_PROVIDER")), "off") {
+		log.Println("AI assistant: ปิด (AI_PROVIDER=off)")
+		return nil
+	}
+	provider, err := assistant.ProviderFromEnv(os.Getenv)
+	if err != nil {
+		log.Println("AI assistant: ปิด เพราะตั้งค่าไม่ถูกต้อง:", err)
+		return nil
+	}
+	log.Println("AI assistant:", provider.Name())
+	return assistant.New(provider, noteRepo, assistant.NewActionRepository(pool))
 }

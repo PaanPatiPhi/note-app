@@ -67,6 +67,45 @@ func NewService(noteRepo *Repository, userRepo *user.Repository) *Service {
 	return &Service{noteRepo: noteRepo, userRepo: userRepo}
 }
 
+// IsCommand บอกว่าข้อความเป็นคำสั่งแบบเดิมที่ CaptureFromLine ตอบได้ทันที (fast path ไม่ต้องใช้ AI)
+// ข้อความอื่นทั้งหมด (โน้ตอิสระ, ลิสต์, เตือน, คำถาม) ให้ AI จัดการ
+// "ดู <x>" ที่ <x> ไม่ใช่วันที่ (เช่น "ดู หนังพรุ่งนี้") ไม่ถือเป็นคำสั่ง
+func IsCommand(text string) bool {
+	t := strings.TrimSpace(text)
+	switch {
+	case t == deleteKeyword,
+		t == viewKeyword, t == viewTodayWord,
+		t == viewChecklistKeyword, t == viewChecklistTodayWord,
+		t == viewNoteKeyword, t == viewNoteTodayWord:
+		return true
+	case strings.HasPrefix(t, editPrefix),
+		strings.HasPrefix(t, searchPrefix):
+		return true
+	case strings.HasPrefix(t, completeItemPrefix):
+		_, err := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(t, completeItemPrefix)))
+		return err == nil
+	case strings.HasSuffix(t, fuzzyDoneSuffix) && t != fuzzyDoneSuffix,
+		strings.HasSuffix(t, fuzzyUndoneSuffix) && t != fuzzyUndoneSuffix:
+		return true
+	}
+	// ลำดับสำคัญ: เช็ค prefix ที่ยาวกว่าก่อน ("ดูลิส " ก่อน "ดู ")
+	for _, prefix := range []string{viewChecklistPrefix, viewNotePrefix, viewPrefix} {
+		if strings.HasPrefix(t, prefix) {
+			_, err := parseThaiDate(strings.TrimSpace(strings.TrimPrefix(t, prefix)))
+			return err == nil
+		}
+	}
+	return false
+}
+
+// ResolveLineUser คืน user ID ในระบบของ LINE user (สร้างใหม่ถ้ายังไม่มี)
+func (s *Service) ResolveLineUser(ctx context.Context, lineUserID string) (string, error) {
+	u, err := s.userRepo.FindOrCreateByLineID(ctx, lineUserID, "")
+	if err != nil {
+		return "", fmt.Errorf("find or create user: %w", err)
+	}
+	return u.ID, nil
+}
 
 func (s *Service) CaptureFromLine(ctx context.Context, lineUserID, displayName, text string) (*CommandResult, error) {
 	u, err := s.userRepo.FindOrCreateByLineID(ctx, lineUserID, displayName)

@@ -58,10 +58,11 @@ type ActionLogger interface {
 
 // ตรวจตอน compile ว่าของจริง implement interface ครบ
 var (
-	_ NoteStore    = (*note.Repository)(nil)
-	_ ActionLogger = (*ActionRepository)(nil)
-	_ Provider     = (*ClaudeProvider)(nil)
-	_ Provider     = (*OllamaProvider)(nil)
+	_ NoteStore      = (*note.Repository)(nil)
+	_ ActionLogger   = (*ActionRepository)(nil)
+	_ Provider       = (*ClaudeProvider)(nil)
+	_ Provider       = (*OllamaProvider)(nil)
+	_ note.Assistant = (*Assistant)(nil)
 )
 
 type Assistant struct {
@@ -236,4 +237,13 @@ func isQuestion(reply string) bool {
 		}
 	}
 	return false
+}
+
+// HandleLine คือ Handle ในรูปที่ LINE webhook ใช้ (implement note.Assistant)
+func (a *Assistant) HandleLine(ctx context.Context, userID, webhookEventID, text string) (string, error) {
+	res, err := a.Handle(ctx, Request{UserID: userID, WebhookEventID: webhookEventID, Text: text})
+	if err != nil {
+		return "", err
+	}
+	return res.Reply, nil
 }

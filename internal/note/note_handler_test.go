@@ -29,7 +29,7 @@ func TestWebhookEventID(t *testing.T) {
 }
 
 func TestWaitReturnsWhenWorkFinishes(t *testing.T) {
-	h := NewHandler(nil, nil, "")
+	h := NewHandler(nil, nil, "", nil)
 	h.wg.Add(1)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
@@ -47,7 +47,7 @@ func TestWaitReturnsWhenWorkFinishes(t *testing.T) {
 // service เป็น nil ทำให้ handleEvent panic ตอน dedupe — processEvents ต้อง recover,
 // ปล่อย semaphore และเรียก wg.Done ให้ Wait กลับมาได้
 func TestProcessEventsRecoversFromPanic(t *testing.T) {
-	h := NewHandler(nil, nil, "")
+	h := NewHandler(nil, nil, "", nil)
 	h.wg.Add(1)
 	h.processEvents([]webhook.EventInterface{
 		webhook.MessageEvent{WebhookEventId: "boom-1"},
