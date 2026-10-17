@@ -124,3 +124,68 @@ func TestSaveDefaultsAndChecklistSource(t *testing.T) {
 			latest.ID, latest.Source, latest.RemindAt)
 	}
 }
+
+func TestOpenChecklistAppendAndAgenda(t *testing.T) {
+	pool := getTestPool(t)
+	ctx := context.Background()
+	repo := NewRepository(pool)
+	userID := createTestUser(t, pool)
+
+	title := "ซื้อของ"
+	list, err := repo.SaveChecklist(ctx, userID, &title, []string{"ขนมปัง"}, NoteSourceLine)
+	if err != nil {
+		t.Fatalf("SaveChecklist: %v", err)
+	}
+
+	found, err := repo.FindOpenChecklistByTitle(ctx, userID, "  ซื้อของ ")
+	if err != nil || found == nil || found.ID != list.ID {
+		t.Fatalf("FindOpenChecklistByTitle = %v, %v; want %s", found, err, list.ID)
+	}
+	if missing, err := repo.FindOpenChecklistByTitle(ctx, userID, "ไม่มีลิสต์นี้"); err != nil || missing != nil {
+		t.Fatalf("FindOpenChecklistByTitle(missing) = %v, %v; want nil, nil", missing, err)
+	}
+
+	added, err := repo.AppendItems(ctx, userID, list.ID, []string{"นม", "ไข่"})
+	if err != nil {
+		t.Fatalf("AppendItems: %v", err)
+	}
+	if len(added) != 2 || added[0].Position != 1 || added[1].Position != 2 {
+		t.Fatalf("AppendItems positions = %+v, want 1 and 2", added)
+	}
+	if _, err := repo.AppendItems(ctx, createTestUser(t, pool), list.ID, []string{"x"}); err == nil {
+		t.Fatal("AppendItems should reject a checklist owned by another user")
+	}
+
+	titles, err := repo.ListOpenChecklistTitles(ctx, userID, 10)
+	if err != nil || len(titles) != 1 || titles[0] != title {
+		t.Fatalf("ListOpenChecklistTitles = %v, %v", titles, err)
+	}
+
+	// ติ๊กครบทุก item แล้ว ลิสต์ต้องไม่ถือว่า "เปิดอยู่"
+	items, _ := repo.FindItemsByNoteID(ctx, list.ID)
+	for _, it := range items {
+		if err := repo.SetItemDone(ctx, userID, it.ID, true); err != nil {
+			t.Fatalf("SetItemDone: %v", err)
+		}
+	}
+	if done, _ := repo.FindOpenChecklistByTitle(ctx, userID, title); done != nil {
+		t.Error("a fully-done checklist should not be returned as open")
+	}
+
+	inRange := time.Date(2026, 10, 16, 9, 0, 0, 0, bangkok)
+	outOfRange := time.Date(2026, 10, 20, 9, 0, 0, 0, bangkok)
+	for _, at := range []time.Time{inRange, outOfRange} {
+		text := "นัด " + at.Format("02/01")
+		if err := repo.SaveNote(ctx, &Note{UserID: userID, Content: &text, Type: NoteTypeReminder, RemindAt: &at, Source: NoteSourceAI}); err != nil {
+			t.Fatalf("SaveNote: %v", err)
+		}
+	}
+	from := time.Date(2026, 10, 16, 0, 0, 0, 0, bangkok)
+	agenda, err := repo.FindAgenda(ctx, userID, from, from.AddDate(0, 0, 1))
+	if err != nil {
+		t.Fatalf("FindAgenda: %v", err)
+	}
+	if len(agenda) != 1 || !agenda[0].RemindAt.Equal(inRange) {
+		t.Fatalf("FindAgenda = %d notes, want only the 16/10 reminder", len(agenda))
+	}
+}

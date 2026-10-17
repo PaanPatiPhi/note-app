@@ -1,0 +1,239 @@
+// Package assistant แปลงข้อความภาษาธรรมชาติจาก LINE เป็นการกระทำกับโน้ต ผ่าน LLM tool calling
+// (Claude หรือ local model ผ่าน Ollama — ดู provider.go)
+package assistant
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log"
+	"strings"
+	"time"
+
+	"jodjod/internal/note"
+)
+
+const (
+	// รอบสูงสุดของ request → tool → request (เช่น search แล้วค่อย complete)
+	// เผื่อรอบที่ใช้เตือนโมเดลให้เรียก tool ไว้ด้วย
+	maxRounds = 5
+
+	// จำนวนครั้งสูงสุดที่เตือนโมเดลเมื่อมันตอบโดยไม่เรียก tool
+	maxNudges = 2
+
+	openListsInContext = 10
+
+	fallbackReply = "ขอโทษครับ ตอนนี้ทำรายการไม่สำเร็จ ลองพิมพ์ใหม่อีกครั้งนะครับ"
+	refusalReply  = "ขอโทษครับ ข้อความนี้ JodJod ช่วยจัดการให้ไม่ได้ครับ"
+)
+
+var bangkok = mustLoadBangkok()
+
+func mustLoadBangkok() *time.Location {
+	loc, err := time.LoadLocation("Asia/Bangkok")
+	if err != nil {
+		return time.FixedZone("Asia/Bangkok", 7*60*60)
+	}
+	return loc
+}
+
+// NoteStore คือ operation ของ note.Repository ที่ tools ใช้
+type NoteStore interface {
+	SaveNote(ctx context.Context, n *note.Note) error
+	SaveChecklist(ctx context.Context, userID string, content *string, items []string, source note.NoteSource) (*note.Note, error)
+	FindOpenChecklistByTitle(ctx context.Context, userID, title string) (*note.Note, error)
+	ListOpenChecklistTitles(ctx context.Context, userID string, limit int) ([]string, error)
+	AppendItems(ctx context.Context, userID, noteID string, items []string) ([]*note.NoteItem, error)
+	FindItemsBySimilarText(ctx context.Context, userID, query string, limit int) ([]*note.ItemMatch, error)
+	SetItemDone(ctx context.Context, userID, itemID string, done bool) error
+	SearchByUser(ctx context.Context, userID, query string) ([]*note.Note, error)
+	FindAgenda(ctx context.Context, userID string, from, to time.Time) ([]*note.Note, error)
+	FindItemsByNoteID(ctx context.Context, noteID string) ([]*note.NoteItem, error)
+}
+
+// ActionLogger บันทึกสิ่งที่ AI ทำ (ใช้ undo, ดูต้นทุน, และเป็น dataset สำหรับ eval)
+type ActionLogger interface {
+	Insert(ctx context.Context, a *Action) (string, error)
+}
+
+// ตรวจตอน compile ว่าของจริง implement interface ครบ
+var (
+	_ NoteStore    = (*note.Repository)(nil)
+	_ ActionLogger = (*ActionRepository)(nil)
+	_ Provider     = (*ClaudeProvider)(nil)
+	_ Provider     = (*OllamaProvider)(nil)
+)
+
+type Assistant struct {
+	provider Provider
+	store    NoteStore
+	actions  ActionLogger
+	now      func() time.Time
+}
+
+func New(provider Provider, store NoteStore, actions ActionLogger) *Assistant {
+	return &Assistant{
+		provider: provider,
+		store:    store,
+		actions:  actions,
+		now:      func() time.Time { return time.Now().In(bangkok) },
+	}
+}
+
+// Request คือข้อความหนึ่งข้อความจากผู้ใช้ที่ resolve เป็น user ในระบบแล้ว
+type Request struct {
+	UserID         string
+	WebhookEventID string
+	Text           string
+}
+
+// Result คือสิ่งที่ handler ต้องใช้ตอบกลับ LINE
+type Result struct {
+	Reply string
+	// ActionID ของแถวใน ai_actions (ว่างถ้าบันทึกไม่สำเร็จ)
+	ActionID string
+	// Wrote = มีการสร้าง/แก้ข้อมูล → ควรแสดงปุ่ม undo
+	Wrote bool
+}
+
+// Handle ส่งข้อความให้โมเดลเลือก tool, รัน tool, วนจนได้คำตอบสุดท้าย แล้วบันทึก ai_actions
+// error ที่คืนคือ error ของระบบ; กรณีโมเดลปฏิเสธหรือถึงขีดจำกัดจะคืน Result พร้อมข้อความสุภาพแทน
+func (a *Assistant) Handle(ctx context.Context, req Request) (*Result, error) {
+	now := a.now()
+	exec := &executor{store: a.store, userID: req.UserID, now: now}
+	action := &Action{UserID: req.UserID, WebhookEventID: req.WebhookEventID, InputText: req.Text, Model: a.provider.Name()}
+
+	reply, runErr := a.run(ctx, req, exec, action, now)
+
+	action.ReplyText = reply
+	action.CreatedNoteIDs = exec.createdNoteIDs
+	action.AddedItemIDs = exec.addedItemIDs
+	action.ItemChanges = exec.itemChanges
+	if runErr != nil {
+		action.Error = runErr.Error()
+	}
+
+	res := &Result{Reply: reply, Wrote: exec.wrote()}
+	if a.actions != nil {
+		// บันทึกด้วย context ใหม่: ถ้า ctx หลักหมดเวลา ก็ยังอยากได้ log ไว้ทำ undo
+		logCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+		id, err := a.actions.Insert(logCtx, action)
+		cancel()
+		if err != nil {
+			log.Println("บันทึก ai_action ล้มเหลว:", err)
+		}
+		res.ActionID = id
+	}
+
+	if runErr != nil && !exec.wrote() {
+		return nil, runErr
+	}
+	if runErr != nil {
+		// เขียนข้อมูลไปบางส่วนแล้ว: ตอบผู้ใช้ให้รู้ (มีปุ่ม undo) แทนการคืน error เงียบๆ
+		log.Println("assistant ล้มเหลวหลังเขียนข้อมูลบางส่วน:", runErr)
+		res.Reply = fallbackReply
+	}
+	return res, nil
+}
+
+func (a *Assistant) run(ctx context.Context, req Request, exec *executor, action *Action, now time.Time) (string, error) {
+	openLists, err := a.store.ListOpenChecklistTitles(ctx, req.UserID, openListsInContext)
+	if err != nil {
+		// ไม่ร้ายแรง: แค่โมเดลจะไม่รู้ชื่อลิสต์เดิม
+		log.Println("โหลดชื่อลิสต์ล้มเหลว:", err)
+	}
+
+	conv := a.provider.Start(systemPrompt, toolSpecs(), buildUserMessage(now, openLists, req.Text))
+
+	var (
+		results  []ToolResult
+		followUp string
+		nudges   int
+	)
+	for round := 0; round < maxRounds; round++ {
+		turn, err := conv.Next(ctx, results, followUp)
+		followUp = ""
+		if err != nil {
+			return fallbackReply, fmt.Errorf("%s request (round %d): %w", a.provider.Name(), round+1, err)
+		}
+		action.addUsage(turn.Usage)
+
+		switch turn.Stop {
+		case StopRefusal:
+			return refusalReply, nil
+		case StopMaxTokens:
+			return fallbackReply, errors.New("model response hit the output token limit")
+		}
+
+		if len(turn.ToolCalls) == 0 {
+			reply := strings.TrimSpace(turn.Text)
+			if reply == "" {
+				return fallbackReply, errors.New("model returned an empty reply")
+			}
+			// โมเดลเล็กบางทีตอบโดยไม่เรียก tool เลย ("✅ ทำแล้ว", "ครับ", "กำลังค้นหา...") → ไม่มีอะไรถูกบันทึก
+			// ทุกข้อความของผู้ใช้ต้องจบด้วย tool อย่างน้อยหนึ่งตัว ยกเว้นโมเดลถามกลับ
+			if len(action.ToolCalls) == 0 && !isQuestion(reply) {
+				if nudges < maxNudges {
+					nudges++
+					results, followUp = nil, nudgeNoToolCall
+					continue
+				}
+				// เตือนครบแล้วยังไม่เรียก tool: ถ้ายังอ้างว่าทำแล้ว อย่าปล่อยให้ผู้ใช้เข้าใจผิด
+				if claimsAction(reply) {
+					return fallbackReply, errors.New("model claimed an action without calling any tool")
+				}
+			}
+			return reply, nil
+		}
+
+		results = results[:0]
+		for _, call := range turn.ToolCalls {
+			run := a.runTool(ctx, exec, call)
+			action.ToolCalls = append(action.ToolCalls, run)
+			results = append(results, ToolResult{
+				CallID: call.ID, Name: call.Name, Content: toolResultText(run), IsError: run.IsError,
+			})
+		}
+	}
+	return fallbackReply, fmt.Errorf("no final reply after %d rounds", maxRounds)
+}
+
+func (a *Assistant) runTool(ctx context.Context, exec *executor, call ToolCall) toolRun {
+	run := toolRun{Name: call.Name, Input: call.Input}
+
+	result, err := exec.run(ctx, call.Name, call.Input)
+	var inputErr errToolInput
+	switch {
+	case errors.As(err, &inputErr):
+		run.IsError, run.Error = true, inputErr.msg
+	case err != nil:
+		// error ของระบบ (DB ฯลฯ): ไม่ส่งรายละเอียดภายในให้โมเดล
+		log.Printf("tool %s ล้มเหลว: %v", call.Name, err)
+		run.IsError, run.Error = true, "internal error, the action was not completed"
+	default:
+		run.Result = result
+	}
+	return run
+}
+
+// claimsAction บอกว่าคำตอบมี emoji ที่ใช้ยืนยันการเขียนข้อมูลหรือไม่
+func claimsAction(reply string) bool {
+	return strings.ContainsAny(reply, confirmationEmojis)
+}
+
+// questionMarkers คือคำ/เครื่องหมายที่บอกว่าโมเดลกำลังถามผู้ใช้กลับ
+// ไม่ใส่ "อะไร" เพราะเจอในประโยคบอกเล่าบ่อย เช่น "ไม่มีนัดอะไร"
+var questionMarkers = []string{
+	"?", "？", "ไหม", "มั้ย", "หรือเปล่า", "รึเปล่า", "หรือไม่",
+	"เมื่อไหร่", "เมื่อไร", "อันไหน", "ตัวไหน", "วันไหน", "กี่โมง",
+}
+
+// isQuestion บอกว่าคำตอบเป็นคำถามกลับไปหาผู้ใช้ (ไม่ต้องเรียก tool ก็ได้)
+func isQuestion(reply string) bool {
+	for _, m := range questionMarkers {
+		if strings.Contains(reply, m) {
+			return true
+		}
+	}
+	return false
+}

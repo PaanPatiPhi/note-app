@@ -2,10 +2,12 @@ package note
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -439,4 +441,126 @@ func (r *Repository) FindItemsBySimilarText(ctx context.Context, userID, query s
 		matches = append(matches, m)
 	}
 	return matches, rows.Err()
+}
+
+// FindOpenChecklistByTitle หา checklist ล่าสุดของ user ที่ชื่อตรงกับ title (ไม่สนตัวพิมพ์/ช่องว่างหัวท้าย)
+// และยังมี item ที่ไม่เสร็จ (หรือยังไม่มี item) — ใช้รวมรายการใหม่เข้าลิสต์เดิม
+// คืน (nil, nil) ถ้าไม่เจอ
+func (r *Repository) FindOpenChecklistByTitle(ctx context.Context, userID, title string) (*Note, error) {
+	q := `
+		SELECT ` + noteColumns + `
+		FROM notes n
+		WHERE n.user_id = $1
+		  AND n.type = 'checklist'
+		  AND lower(btrim(n.content)) = lower(btrim($2))
+		  AND (
+		    NOT EXISTS (SELECT 1 FROM note_items ni WHERE ni.note_id = n.id)
+		    OR EXISTS (SELECT 1 FROM note_items ni WHERE ni.note_id = n.id AND NOT ni.is_done)
+		  )
+		ORDER BY n.created_at DESC
+		LIMIT 1
+	`
+	n, err := scanNote(r.pool.QueryRow(ctx, q, userID, title))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("find open checklist: %w", err)
+	}
+	return n, nil
+}
+
+// ListOpenChecklistTitles คืนชื่อ checklist ที่ยังมี item ไม่เสร็จ (ไม่ซ้ำ, ล่าสุดก่อน)
+// ใช้เป็น context ให้ AI รวมรายการเข้าลิสต์เดิม
+func (r *Repository) ListOpenChecklistTitles(ctx context.Context, userID string, limit int) ([]string, error) {
+	q := `
+		SELECT btrim(n.content) AS title
+		FROM notes n
+		WHERE n.user_id = $1
+		  AND n.type = 'checklist'
+		  AND n.content IS NOT NULL AND btrim(n.content) <> ''
+		  AND EXISTS (SELECT 1 FROM note_items ni WHERE ni.note_id = n.id AND NOT ni.is_done)
+		GROUP BY btrim(n.content)
+		ORDER BY max(n.created_at) DESC
+		LIMIT $2
+	`
+	rows, err := r.pool.Query(ctx, q, userID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list open checklist titles: %w", err)
+	}
+	defer rows.Close()
+
+	var titles []string
+	for rows.Next() {
+		var t string
+		if err := rows.Scan(&t); err != nil {
+			return nil, fmt.Errorf("scan checklist title: %w", err)
+		}
+		titles = append(titles, t)
+	}
+	return titles, rows.Err()
+}
+
+// AppendItems เพิ่ม item ต่อท้าย checklist ของ user (ตรวจ ownership ด้วย userID)
+func (r *Repository) AppendItems(ctx context.Context, userID, noteID string, items []string) ([]*NoteItem, error) {
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	// lock note ไว้กันสอง request เพิ่มพร้อมกันแล้วได้ position ซ้ำ
+	var next int
+	err = tx.QueryRow(ctx, `
+		SELECT coalesce((SELECT max(position) + 1 FROM note_items WHERE note_id = n.id), 0)
+		FROM notes n
+		WHERE n.id = $1 AND n.user_id = $2 AND n.type = 'checklist'
+		FOR UPDATE
+	`, noteID, userID).Scan(&next)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, fmt.Errorf("checklist not found or not owned by user")
+	}
+	if err != nil {
+		return nil, fmt.Errorf("next item position: %w", err)
+	}
+
+	added := make([]*NoteItem, 0, len(items))
+	for i, text := range items {
+		it := &NoteItem{NoteID: noteID, Text: text, Position: next + i}
+		err := tx.QueryRow(ctx,
+			`INSERT INTO note_items (note_id, text, position) VALUES ($1, $2, $3) RETURNING id`,
+			noteID, text, it.Position,
+		).Scan(&it.ID)
+		if err != nil {
+			return nil, fmt.Errorf("insert note_item %d: %w", i, err)
+		}
+		added = append(added, it)
+	}
+
+	if _, err := tx.Exec(ctx, `UPDATE notes SET updated_at = now() WHERE id = $1`, noteID); err != nil {
+		return nil, fmt.Errorf("touch note: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit tx: %w", err)
+	}
+	return added, nil
+}
+
+// FindAgenda คืน reminder (remind_at) และโน้ตที่มี due_date อยู่ในช่วง [from, to)
+// เรียงตามเวลาที่เกี่ยวข้อง
+func (r *Repository) FindAgenda(ctx context.Context, userID string, from, to time.Time) ([]*Note, error) {
+	q := `
+		SELECT ` + noteColumns + `
+		FROM notes
+		WHERE user_id = $1
+		  AND ((remind_at >= $2 AND remind_at < $3) OR (due_date >= $2 AND due_date < $3))
+		ORDER BY coalesce(remind_at, due_date)
+		LIMIT 50
+	`
+	rows, err := r.pool.Query(ctx, q, userID, from, to)
+	if err != nil {
+		return nil, fmt.Errorf("find agenda: %w", err)
+	}
+	defer rows.Close()
+	return scanNotes(rows)
 }
