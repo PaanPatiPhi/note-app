@@ -34,8 +34,19 @@ const (
 // Assistant คือ AI ที่แปลงข้อความอิสระเป็นการกระทำ (implement โดย internal/assistant)
 // แยกเป็น interface ที่นี่เพื่อไม่ให้ package note import assistant (assistant import note อยู่แล้ว)
 type Assistant interface {
-	// HandleLine คืนข้อความตอบกลับ; error = ไม่ได้เขียนข้อมูลใดเลย ผู้เรียก fallback ได้
-	HandleLine(ctx context.Context, userID, webhookEventID, text string) (string, error)
+	// HandleLine คืนคำตอบ; error = ไม่ได้เขียนข้อมูลใดเลย ผู้เรียก fallback ได้
+	HandleLine(ctx context.Context, userID, webhookEventID, text string) (AIReply, error)
+	// Undo ย้อนสิ่งที่ AI ทำใน action นั้น แล้วคืนข้อความที่จะตอบผู้ใช้
+	Undo(ctx context.Context, userID, actionID string) (string, error)
+}
+
+// AIReply คือผลของ AI หนึ่งข้อความ
+type AIReply struct {
+	Text string
+	// ActionID ใช้ทำปุ่มยกเลิก; ว่างถ้าบันทึก action ไม่สำเร็จ
+	ActionID string
+	// Undoable = AI เขียนข้อมูลจริงและมี ActionID → แสดงปุ่มยกเลิก
+	Undoable bool
 }
 
 type Handler struct {
@@ -212,7 +223,11 @@ func (h *Handler) handleWithAI(ctx context.Context, lineUserID, webhookEventID, 
 		return false
 	}
 
-	h.reply(ctx, replyToken, reply)
+	if reply.Undoable {
+		h.replyWithUndo(ctx, replyToken, reply.Text, reply.ActionID)
+	} else {
+		h.reply(ctx, replyToken, reply.Text)
+	}
 	log.Printf("LINE AI timing: resolve_user=%s ai=%s reply=%s total=%s",
 		resolved.Round(time.Millisecond), (aiDone - resolved).Round(time.Millisecond),
 		(time.Since(start) - aiDone).Round(time.Millisecond), time.Since(start).Round(time.Millisecond))
@@ -246,6 +261,13 @@ func (h *Handler) handlePostbackEvent(ctx context.Context, e webhook.PostbackEve
 		return
 	}
 
+	switch values.Get("action") {
+	case postbackUndo:
+		h.handleUndo(ctx, source.UserId, values.Get("id"), e.ReplyToken)
+		return
+	}
+
+	// postback แบบเดิม (ไม่มี action): ปุ่มเลือก item ที่คล้ายกัน "item_id=...&done=..."
 	itemID := values.Get("item_id")
 	done := values.Get("done") == "true"
 	if itemID == "" {
@@ -407,4 +429,57 @@ func (h *Handler) reply(ctx context.Context, replyToken, text string) {
 	if err != nil {
 		log.Println("reply ล้มเหลว:", err)
 	}
+}
+const (
+	postbackUndo = "undo"
+	undoLabel    = "↩️ ยกเลิก"
+)
+
+// undoPostbackData คือ data ของปุ่มยกเลิก (LINE จำกัด 300 ตัวอักษร; uuid 36 ตัว)
+func undoPostbackData(actionID string) string {
+	return url.Values{"action": {postbackUndo}, "id": {actionID}}.Encode()
+}
+
+// replyWithUndo ตอบพร้อมปุ่ม Quick Reply "↩️ ยกเลิก" ให้ย้อนสิ่งที่ AI เพิ่งทำ
+func (h *Handler) replyWithUndo(ctx context.Context, replyToken, text, actionID string) {
+	_, err := h.bot.ReplyMessage(&messaging_api.ReplyMessageRequest{
+		ReplyToken: replyToken,
+		Messages: []messaging_api.MessageInterface{
+			&messaging_api.TextMessage{
+				Text: text,
+				QuickReply: &messaging_api.QuickReply{Items: []messaging_api.QuickReplyItem{{
+					Type: "action",
+					Action: &messaging_api.PostbackAction{
+						Label:       undoLabel,
+						Data:        undoPostbackData(actionID),
+						DisplayText: undoLabel,
+					},
+				}}},
+			},
+		},
+	})
+	if err != nil {
+		log.Println("reply พร้อมปุ่มยกเลิก ล้มเหลว:", err)
+	}
+}
+
+// handleUndo รับการกดปุ่มยกเลิก; action ต้องเป็นของ user คนที่กดเท่านั้น (ตรวจใน Undo)
+func (h *Handler) handleUndo(ctx context.Context, lineUserID, actionID, replyToken string) {
+	if h.ai == nil {
+		h.reply(ctx, replyToken, "ตอนนี้ยกเลิกไม่ได้ครับ ลองลบในหน้าเว็บแทนนะครับ")
+		return
+	}
+	userID, err := h.service.ResolveLineUser(ctx, lineUserID)
+	if err != nil {
+		log.Println("resolve user สำหรับ undo ล้มเหลว:", err)
+		h.reply(ctx, replyToken, "ขอโทษครับ ยกเลิกไม่สำเร็จ ลองอีกครั้งนะครับ")
+		return
+	}
+	text, err := h.ai.Undo(ctx, userID, actionID)
+	if err != nil {
+		log.Println("undo ล้มเหลว:", err)
+		h.reply(ctx, replyToken, "ขอโทษครับ ยกเลิกไม่สำเร็จ ลองอีกครั้งนะครับ")
+		return
+	}
+	h.reply(ctx, replyToken, text)
 }

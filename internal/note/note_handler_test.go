@@ -3,6 +3,7 @@ package note
 import (
 	"context"
 	"errors"
+	"net/url"
 	"testing"
 	"time"
 
@@ -61,5 +62,20 @@ func TestProcessEventsRecoversFromPanic(t *testing.T) {
 	}
 	if n := len(h.sem); n != 0 {
 		t.Fatalf("semaphore still holds %d slots", n)
+	}
+}
+
+func TestUndoPostbackData(t *testing.T) {
+	const id = "6f1c2b9e-1d3a-4c5b-9e8f-0a1b2c3d4e5f"
+	data := undoPostbackData(id)
+	if len(data) > 300 {
+		t.Fatalf("postback data is %d chars, LINE allows 300", len(data))
+	}
+	v, err := url.ParseQuery(data)
+	if err != nil || v.Get("action") != postbackUndo || v.Get("id") != id {
+		t.Fatalf("round trip = %v, %v", v, err)
+	}
+	if n := len([]rune(undoLabel)); n > 20 {
+		t.Errorf("quick reply label is %d chars, LINE allows 20", n)
 	}
 }

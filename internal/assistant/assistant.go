@@ -54,6 +54,7 @@ type NoteStore interface {
 // ActionLogger บันทึกสิ่งที่ AI ทำ (ใช้ undo, ดูต้นทุน, และเป็น dataset สำหรับ eval)
 type ActionLogger interface {
 	Insert(ctx context.Context, a *Action) (string, error)
+	Undo(ctx context.Context, userID, actionID string) (*UndoResult, error)
 }
 
 // ตรวจตอน compile ว่าของจริง implement interface ครบ
@@ -252,12 +253,49 @@ func isQuestion(reply string) bool {
 }
 
 // HandleLine คือ Handle ในรูปที่ LINE webhook ใช้ (implement note.Assistant)
-func (a *Assistant) HandleLine(ctx context.Context, userID, webhookEventID, text string) (string, error) {
+func (a *Assistant) HandleLine(ctx context.Context, userID, webhookEventID, text string) (note.AIReply, error) {
 	res, err := a.Handle(ctx, Request{UserID: userID, WebhookEventID: webhookEventID, Text: text})
+	if err != nil {
+		return note.AIReply{}, err
+	}
+	return note.AIReply{Text: res.Reply, ActionID: res.ActionID, Undoable: res.Wrote && res.ActionID != ""}, nil
+}
+
+// Undo ย้อนสิ่งที่ AI ทำใน action นั้น (จากปุ่มยกเลิกใน LINE) แล้วคืนข้อความตอบผู้ใช้
+func (a *Assistant) Undo(ctx context.Context, userID, actionID string) (string, error) {
+	if a.actions == nil {
+		return "", errors.New("action log is not configured")
+	}
+	res, err := a.actions.Undo(ctx, userID, actionID)
 	if err != nil {
 		return "", err
 	}
-	return res.Reply, nil
+	return undoReplyText(res), nil
+}
+
+func undoReplyText(r *UndoResult) string {
+	switch {
+	case r.NotFound:
+		return "ไม่พบรายการที่จะยกเลิกครับ"
+	case r.AlreadyUndone:
+		return "รายการนี้ยกเลิกไปแล้วครับ"
+	case r.Expired:
+		return "ยกเลิกได้ภายใน 24 ชั่วโมงครับ รายการนี้เก่าเกินไปแล้ว"
+	}
+	var parts []string
+	if r.DeletedNotes > 0 {
+		parts = append(parts, fmt.Sprintf("ลบที่จดไว้ %d รายการ", r.DeletedNotes))
+	}
+	if r.RemovedItems > 0 {
+		parts = append(parts, fmt.Sprintf("เอาออกจากลิสต์ %d รายการ", r.RemovedItems))
+	}
+	if r.RestoredItems > 0 {
+		parts = append(parts, fmt.Sprintf("คืนสถานะติ๊ก %d รายการ", r.RestoredItems))
+	}
+	if len(parts) == 0 {
+		return "↩️ ยกเลิกแล้วครับ (ข้อมูลถูกลบหรือแก้ไปก่อนหน้านี้แล้ว)"
+	}
+	return "↩️ ยกเลิกแล้วครับ: " + strings.Join(parts, ", ")
 }
 
 // Warmup โหลดโมเดลล่วงหน้าถ้า provider รองรับ (เรียกตอน start server) ไม่งั้นไม่ทำอะไร

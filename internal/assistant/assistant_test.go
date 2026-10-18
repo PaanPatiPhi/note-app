@@ -560,3 +560,45 @@ func TestReminderHintNotAddedWhenTimeGiven(t *testing.T) {
 		t.Errorf("hint must not be added when a reminder was set: %q", res.Reply)
 	}
 }
+
+func (f *fakeActions) Undo(context.Context, string, string) (*UndoResult, error) {
+	return &UndoResult{}, nil
+}
+
+func TestHandleLineMarksUndoable(t *testing.T) {
+	llm := &fakeLLM{responses: []string{
+		toolUseMsg("t1", "create_note", map[string]any{"content": "x"}),
+		textMsg("✅ จดแล้วครับ"),
+	}}
+	a, _ := newTestAssistant(llm, newFakeStore())
+	reply, err := a.HandleLine(context.Background(), "user-1", "evt", "จดว่า x")
+	if err != nil || !reply.Undoable || reply.ActionID != "action-1" || reply.Text != "✅ จดแล้วครับ" {
+		t.Fatalf("HandleLine = %+v, %v", reply, err)
+	}
+
+	read := &fakeLLM{responses: []string{
+		toolUseMsg("t1", "search_notes", map[string]any{"query": "x"}),
+		textMsg("ไม่เจอครับ"),
+	}}
+	a2, _ := newTestAssistant(read, newFakeStore())
+	if reply, _ := a2.HandleLine(context.Background(), "user-1", "evt", "หาเรื่อง x"); reply.Undoable {
+		t.Error("read-only actions should not get an undo button")
+	}
+}
+
+func TestUndoReplyText(t *testing.T) {
+	for _, tc := range []struct {
+		res  UndoResult
+		want string
+	}{
+		{UndoResult{NotFound: true}, "ไม่พบรายการที่จะยกเลิกครับ"},
+		{UndoResult{AlreadyUndone: true}, "รายการนี้ยกเลิกไปแล้วครับ"},
+		{UndoResult{Expired: true}, "ยกเลิกได้ภายใน 24 ชั่วโมงครับ รายการนี้เก่าเกินไปแล้ว"},
+		{UndoResult{DeletedNotes: 1, RemovedItems: 2}, "↩️ ยกเลิกแล้วครับ: ลบที่จดไว้ 1 รายการ, เอาออกจากลิสต์ 2 รายการ"},
+		{UndoResult{}, "↩️ ยกเลิกแล้วครับ (ข้อมูลถูกลบหรือแก้ไปก่อนหน้านี้แล้ว)"},
+	} {
+		if got := undoReplyText(&tc.res); got != tc.want {
+			t.Errorf("undoReplyText(%+v) = %q, want %q", tc.res, got, tc.want)
+		}
+	}
+}

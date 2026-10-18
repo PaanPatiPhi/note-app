@@ -3,10 +3,13 @@ package assistant
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -114,4 +117,107 @@ func (t timing) String() string {
 	return fmt.Sprintf("lists=%s llm=%s [%s] tools=%s log=%s",
 		t.lists.Round(time.Millisecond), total.Round(time.Millisecond), strings.Join(parts, " "),
 		t.tools.Round(time.Millisecond), t.log.Round(time.Millisecond))
+}
+
+// undoWindow คือระยะเวลาที่กดยกเลิกได้หลัง AI ทำรายการ
+const undoWindow = 24 * time.Hour
+
+var uuidPattern = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+
+// UndoResult สรุปสิ่งที่ undo ทำไป
+type UndoResult struct {
+	NotFound      bool
+	AlreadyUndone bool
+	Expired       bool
+
+	DeletedNotes  int64 // โน้ต/ลิสต์/เตือน ที่ AI สร้าง แล้วถูกลบ
+	RemovedItems  int64 // item ที่ AI เพิ่มเข้าลิสต์เดิม แล้วถูกเอาออก
+	RestoredItems int64 // item ที่ AI ติ๊ก แล้วถูกคืนสถานะเดิม
+}
+
+// Undo ย้อนทุกอย่างที่ ai_action นี้ทำ ภายใน transaction เดียว
+// ทุกคำสั่งผูก user_id เสมอ: กดปุ่มของคนอื่น (หรือแก้ postback data เอง) ทำอะไรข้อมูลคนอื่นไม่ได้
+func (r *ActionRepository) Undo(ctx context.Context, userID, actionID string) (*UndoResult, error) {
+	if !uuidPattern.MatchString(actionID) {
+		return &UndoResult{NotFound: true}, nil
+	}
+
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	var (
+		createdNoteIDs []string
+		rawDetails     []byte
+		undoneAt       *time.Time
+		createdAt      time.Time
+	)
+	err = tx.QueryRow(ctx, `
+		SELECT created_note_ids::text[], tool_calls::text, undone_at, created_at
+		FROM ai_actions WHERE id = $1 AND user_id = $2
+		FOR UPDATE
+	`, actionID, userID).Scan(&createdNoteIDs, &rawDetails, &undoneAt, &createdAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return &UndoResult{NotFound: true}, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("load ai_action: %w", err)
+	}
+	if undoneAt != nil {
+		return &UndoResult{AlreadyUndone: true}, nil
+	}
+	if time.Since(createdAt) > undoWindow {
+		return &UndoResult{Expired: true}, nil
+	}
+
+	var details actionDetails
+	if err := json.Unmarshal(rawDetails, &details); err != nil {
+		return nil, fmt.Errorf("decode tool_calls: %w", err)
+	}
+
+	res := &UndoResult{}
+	if len(details.ItemChanges) > 0 {
+		ids := make([]string, len(details.ItemChanges))
+		prev := make([]bool, len(details.ItemChanges))
+		for i, c := range details.ItemChanges {
+			ids[i], prev[i] = c.ItemID, c.PreviousDone
+		}
+		tag, err := tx.Exec(ctx, `
+			UPDATE note_items ni SET is_done = c.prev
+			FROM unnest($1::uuid[], $2::bool[]) AS c(id, prev), notes n
+			WHERE ni.id = c.id AND ni.note_id = n.id AND n.user_id = $3
+		`, ids, prev, userID)
+		if err != nil {
+			return nil, fmt.Errorf("restore items: %w", err)
+		}
+		res.RestoredItems = tag.RowsAffected()
+	}
+	if len(details.AddedItemIDs) > 0 {
+		tag, err := tx.Exec(ctx, `
+			DELETE FROM note_items ni USING notes n
+			WHERE ni.id = ANY($1::uuid[]) AND ni.note_id = n.id AND n.user_id = $2
+		`, details.AddedItemIDs, userID)
+		if err != nil {
+			return nil, fmt.Errorf("remove added items: %w", err)
+		}
+		res.RemovedItems = tag.RowsAffected()
+	}
+	if len(createdNoteIDs) > 0 {
+		// note_items ของโน้ตเหล่านี้ถูกลบตามด้วย ON DELETE CASCADE
+		tag, err := tx.Exec(ctx, `DELETE FROM notes WHERE id = ANY($1::uuid[]) AND user_id = $2`, createdNoteIDs, userID)
+		if err != nil {
+			return nil, fmt.Errorf("delete created notes: %w", err)
+		}
+		res.DeletedNotes = tag.RowsAffected()
+	}
+
+	if _, err := tx.Exec(ctx, `UPDATE ai_actions SET undone_at = now() WHERE id = $1`, actionID); err != nil {
+		return nil, fmt.Errorf("mark undone: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit tx: %w", err)
+	}
+	return res, nil
 }
