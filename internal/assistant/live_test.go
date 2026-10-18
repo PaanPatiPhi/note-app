@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -65,6 +66,7 @@ func TestLiveSmoke(t *testing.T) {
 		{"ซื้อนมแล้ว", "complete_items", time.Time{}},
 		{"อาทิตย์นี้มีนัดอะไรบ้าง", "list_agenda", time.Time{}},
 		{"ประชุม 3, 4, 5 คนมา", "create_note", time.Time{}},
+		{"เตือนให้ซื้อพัดลมใหม่หน่อย", "create_note", time.Time{}}, // ไม่มีเวลา → ต้องไม่ตั้งเตือนเอง
 	}
 
 	passed := 0
@@ -92,14 +94,23 @@ func TestLiveSmoke(t *testing.T) {
 			act := actions.saved[0]
 			var tools []string
 			for _, c := range act.ToolCalls {
-				tools = append(tools, c.Name)
+				if !c.IsError {
+					tools = append(tools, c.Name) // นับเฉพาะ tool ที่สำเร็จ
+				}
 				in, _ := json.Marshal(c.Input)
 				t.Logf("tool %s input=%s error=%q", c.Name, in, c.Error)
 			}
 			t.Logf("reply (%s, in=%d out=%d tokens): %s", elapsed.Round(time.Millisecond), act.InputTokens, act.OutputTokens, res.Reply)
 
-			if len(tools) == 0 || tools[0] != tc.wantTool {
-				t.Errorf("first tool = %v, want %s", tools, tc.wantTool)
+			if !slices.Contains(tools, tc.wantTool) {
+				t.Errorf("successful tools = %v, want %s", tools, tc.wantTool)
+			}
+			if tc.wantRemindAt.IsZero() {
+				for _, n := range store.notes {
+					if n.Type == note.NoteTypeReminder {
+						t.Errorf("unexpected reminder at %v", n.RemindAt)
+					}
+				}
 			}
 			if !tc.wantRemindAt.IsZero() {
 				var got *time.Time

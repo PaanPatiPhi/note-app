@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sort"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -38,39 +39,37 @@ func (r *Repository) SaveNote(ctx context.Context, n *Note) error {
 }
 
 func (r *Repository) SaveChecklist(ctx context.Context, userID string, content *string, items []string, source NoteSource) (*Note, error) {
-	tx, err := r.pool.Begin(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("begin tx: %w", err)
-	}
-	defer tx.Rollback(ctx)
-
 	if source == "" {
 		source = NoteSourceLine
 	}
 	n := &Note{UserID: userID, Content: content, Type: NoteTypeChecklist, Source: source}
 
-	noteQuery := `
-		INSERT INTO notes (user_id, content, type, source)
-		VALUES ($1, $2, $3, $4)
-		RETURNING id, created_at, updated_at
+	// คำสั่งเดียว (atomic) แทน BEGIN + insert ทีละ item + COMMIT: DB อยู่ไกล แต่ละ round trip ~0.4 วิ
+	query := `
+		WITH n AS (
+			INSERT INTO notes (user_id, content, type, source)
+			VALUES ($1, $2, $3, $4)
+			RETURNING id, created_at, updated_at
+		), i AS (
+			INSERT INTO note_items (note_id, text, position)
+			SELECT n.id, u.text, u.ord - 1
+			FROM n, unnest($5::text[]) WITH ORDINALITY AS u(text, ord)
+		)
+		SELECT id, created_at, updated_at FROM n
 	`
-	err = tx.QueryRow(ctx, noteQuery, n.UserID, n.Content, n.Type, n.Source).
+	err := r.pool.QueryRow(ctx, query, n.UserID, n.Content, n.Type, n.Source, nonNilStrings(items)).
 		Scan(&n.ID, &n.CreatedAt, &n.UpdatedAt)
 	if err != nil {
-		return nil, fmt.Errorf("insert note: %w", err)
-	}
-
-	itemQuery := `INSERT INTO note_items (note_id, text, position) VALUES ($1, $2, $3)`
-	for i, itemText := range items {
-		if _, err := tx.Exec(ctx, itemQuery, n.ID, itemText, i); err != nil {
-			return nil, fmt.Errorf("insert note_item %d: %w", i, err)
-		}
-	}
-
-	if err := tx.Commit(ctx); err != nil {
-		return nil, fmt.Errorf("commit tx: %w", err)
+		return nil, fmt.Errorf("save checklist: %w", err)
 	}
 	return n, nil
+}
+
+func nonNilStrings(ss []string) []string {
+	if ss == nil {
+		return []string{}
+	}
+	return ss
 }
 
 func (r *Repository) FindLatestByUser(ctx context.Context, userID string) (*Note, error) {
@@ -509,37 +508,44 @@ func (r *Repository) AppendItems(ctx context.Context, userID, noteID string, ite
 	}
 	defer tx.Rollback(ctx)
 
-	// lock note ไว้กันสอง request เพิ่มพร้อมกันแล้วได้ position ซ้ำ
-	var next int
-	err = tx.QueryRow(ctx, `
-		SELECT coalesce((SELECT max(position) + 1 FROM note_items WHERE note_id = n.id), 0)
-		FROM notes n
-		WHERE n.id = $1 AND n.user_id = $2 AND n.type = 'checklist'
-		FOR UPDATE
-	`, noteID, userID).Scan(&next)
-	if errors.Is(err, pgx.ErrNoRows) {
+	// lock note ไว้ (พร้อมอัปเดต updated_at) กันสอง request เพิ่มพร้อมกันแล้วได้ position ซ้ำ
+	tag, err := tx.Exec(ctx, `
+		UPDATE notes SET updated_at = now()
+		WHERE id = $1 AND user_id = $2 AND type = 'checklist'
+	`, noteID, userID)
+	if err != nil {
+		return nil, fmt.Errorf("lock checklist: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
 		return nil, fmt.Errorf("checklist not found or not owned by user")
 	}
-	if err != nil {
-		return nil, fmt.Errorf("next item position: %w", err)
-	}
 
+	// insert ทุก item ในคำสั่งเดียว; คำสั่งนี้เริ่มหลังได้ lock แล้ว จึงเห็น item ที่ request อื่นเพิ่งเพิ่ม
+	rows, err := tx.Query(ctx, `
+		INSERT INTO note_items (note_id, text, position)
+		SELECT $1, u.text,
+		       (SELECT coalesce(max(position) + 1, 0) FROM note_items WHERE note_id = $1) + u.ord - 1
+		FROM unnest($2::text[]) WITH ORDINALITY AS u(text, ord)
+		RETURNING id, text, position
+	`, noteID, nonNilStrings(items))
+	if err != nil {
+		return nil, fmt.Errorf("insert note_items: %w", err)
+	}
 	added := make([]*NoteItem, 0, len(items))
-	for i, text := range items {
-		it := &NoteItem{NoteID: noteID, Text: text, Position: next + i}
-		err := tx.QueryRow(ctx,
-			`INSERT INTO note_items (note_id, text, position) VALUES ($1, $2, $3) RETURNING id`,
-			noteID, text, it.Position,
-		).Scan(&it.ID)
-		if err != nil {
-			return nil, fmt.Errorf("insert note_item %d: %w", i, err)
+	for rows.Next() {
+		it := &NoteItem{NoteID: noteID}
+		if err := rows.Scan(&it.ID, &it.Text, &it.Position); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("scan note_item: %w", err)
 		}
 		added = append(added, it)
 	}
-
-	if _, err := tx.Exec(ctx, `UPDATE notes SET updated_at = now() WHERE id = $1`, noteID); err != nil {
-		return nil, fmt.Errorf("touch note: %w", err)
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("insert note_items: %w", err)
 	}
+	sort.Slice(added, func(i, j int) bool { return added[i].Position < added[j].Position })
+
 	if err := tx.Commit(ctx); err != nil {
 		return nil, fmt.Errorf("commit tx: %w", err)
 	}

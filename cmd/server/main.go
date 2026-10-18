@@ -156,8 +156,20 @@ func newPool(ctx context.Context, databaseURL string) (*pgxpool.Pool, error) {
 		return nil, err
 	}
 	config.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
-	return pgxpool.NewWithConfig(ctx, config)
+	// DB อยู่ไกล (Supabase Sydney) การเปิด connection ใหม่ใช้เวลาเป็นวินาที
+	// เก็บ connection เปิดไว้อย่างน้อย 2 อัน และเปิดตั้งแต่ start ข้อความแรกจะได้ไม่ต้องรอ
+	config.MinConns = 2
+	pool, err := pgxpool.NewWithConfig(ctx, config)
+	if err != nil {
+		return nil, err
+	}
+	if err := pool.Ping(ctx); err != nil {
+		pool.Close()
+		return nil, err
+	}
+	return pool, nil
 }
+
 // newAssistant สร้าง AI ตาม AI_PROVIDER (ollama ค่าเริ่มต้น, claude, หรือ off)
 // คืน nil ถ้าปิดหรือตั้งค่าผิด → ทุกข้อความใน LINE ใช้คำสั่งแบบเดิม
 func newAssistant(pool *pgxpool.Pool, noteRepo *note.Repository) note.Assistant {
@@ -171,5 +183,18 @@ func newAssistant(pool *pgxpool.Pool, noteRepo *note.Repository) note.Assistant 
 		return nil
 	}
 	log.Println("AI assistant:", provider.Name())
-	return assistant.New(provider, noteRepo, assistant.NewActionRepository(pool))
+	ai := assistant.New(provider, noteRepo, assistant.NewActionRepository(pool))
+
+	// โหลดโมเดลเข้า GPU ตั้งแต่ start ข้อความแรกจะได้ไม่ต้องรอโหลด
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		start := time.Now()
+		if err := ai.Warmup(ctx); err != nil {
+			log.Println("AI warmup ล้มเหลว (จะลองโหลดตอนมีข้อความแรก):", err)
+			return
+		}
+		log.Printf("AI warmup เสร็จใน %s", time.Since(start).Round(time.Millisecond))
+	}()
+	return ai
 }

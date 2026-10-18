@@ -192,23 +192,30 @@ func (h *Handler) handleMessageEvent(ctx context.Context, msgEvent webhook.Messa
 // handleWithAI ส่งข้อความให้ AI แล้วตอบกลับ คืน false ถ้า AI ใช้ไม่ได้และยังไม่ได้เขียนข้อมูล
 // (เช่น Ollama ไม่ได้เปิด) ให้ผู้เรียก fallback ไปทาง rule-based เพื่อไม่ให้ข้อความหาย
 func (h *Handler) handleWithAI(ctx context.Context, lineUserID, webhookEventID, replyToken, text string) bool {
+	start := time.Now()
+	// แสดงจุดสามจุดก่อนอย่างอื่น ผู้ใช้จะได้เห็นว่าบอทรับข้อความแล้ว
+	go h.showLoading(lineUserID)
+
 	userID, err := h.service.ResolveLineUser(ctx, lineUserID)
 	if err != nil {
 		log.Println("resolve user สำหรับ AI ล้มเหลว:", err)
 		return false
 	}
-
-	h.showLoading(lineUserID)
+	resolved := time.Since(start)
 
 	aiCtx, cancel := context.WithTimeout(ctx, aiTimeout)
 	defer cancel()
 	reply, err := h.ai.HandleLine(aiCtx, userID, webhookEventID, text)
+	aiDone := time.Since(start)
 	if err != nil {
-		log.Println("AI ล้มเหลว ใช้ rule-based แทน:", err)
+		log.Printf("AI ล้มเหลวหลัง %s ใช้ rule-based แทน: %v", aiDone.Round(time.Millisecond), err)
 		return false
 	}
 
 	h.reply(ctx, replyToken, reply)
+	log.Printf("LINE AI timing: resolve_user=%s ai=%s reply=%s total=%s",
+		resolved.Round(time.Millisecond), (aiDone - resolved).Round(time.Millisecond),
+		(time.Since(start) - aiDone).Round(time.Millisecond), time.Since(start).Round(time.Millisecond))
 	return true
 }
 

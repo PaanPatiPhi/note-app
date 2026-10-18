@@ -109,6 +109,11 @@ type executor struct {
 	store  NoteStore
 	userID string
 	now    time.Time
+	// userText คือข้อความต้นฉบับของผู้ใช้ ใช้ตรวจว่าผู้ใช้บอกเวลาเองจริงก่อนตั้งเตือน
+	userText string
+
+	savedNote     bool // มีการ create_note สำเร็จ
+	savedReminder bool // มีการ create_reminder สำเร็จ
 
 	createdNoteIDs []string
 	addedItemIDs   []string
@@ -207,6 +212,7 @@ func (e *executor) createNote(ctx context.Context, content, dueDate string) (any
 	if err := e.store.SaveNote(ctx, n); err != nil {
 		return nil, err
 	}
+	e.savedNote = true
 	e.createdNoteIDs = append(e.createdNoteIDs, n.ID)
 	return map[string]any{"note_id": n.ID, "saved": content}, nil
 }
@@ -262,6 +268,10 @@ func (e *executor) createReminder(ctx context.Context, text, remindAt string) (a
 	if err != nil {
 		return nil, err
 	}
+	if !mentionsTime(e.userText) {
+		return nil, badInput("the user did not say any date or time, so do not create a reminder and do not invent a time. " +
+			"Save it with create_note instead, then tell the user it was noted and that they can send a day or time (e.g. \"พรุ่งนี้ 9 โมง\") to get a reminder")
+	}
 	at, err := time.Parse(time.RFC3339, strings.TrimSpace(remindAt))
 	if err != nil {
 		return nil, badInput("remind_at must be RFC3339, e.g. 2026-10-16T09:00:00+07:00")
@@ -274,6 +284,7 @@ func (e *executor) createReminder(ctx context.Context, text, remindAt string) (a
 	if err := e.store.SaveNote(ctx, n); err != nil {
 		return nil, err
 	}
+	e.savedReminder = true
 	e.createdNoteIDs = append(e.createdNoteIDs, n.ID)
 	return map[string]any{"note_id": n.ID, "text": text, "remind_at": at.In(bangkok).Format(time.RFC3339), "when": thaiDateTime(at)}, nil
 }

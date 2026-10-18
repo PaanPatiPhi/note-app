@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -61,7 +62,18 @@ func mustLoadBangkok() *time.Location {
 type Service struct {
 	noteRepo *Repository
 	userRepo *user.Repository
+
+	// lineUsers จำ LINE user ID → user ID ไว้ชั่วคราว ลด query ไป DB (อยู่ไกล ~0.4 วิ/query)
+	// หมดอายุเร็วเพราะการเชื่อมบัญชีบนเว็บเปลี่ยน mapping ได้
+	lineUsers sync.Map // string → cachedUser
 }
+
+type cachedUser struct {
+	id      string
+	expires time.Time
+}
+
+const lineUserCacheTTL = 10 * time.Minute
 
 func NewService(noteRepo *Repository, userRepo *user.Repository) *Service {
 	return &Service{noteRepo: noteRepo, userRepo: userRepo}
@@ -100,10 +112,16 @@ func IsCommand(text string) bool {
 
 // ResolveLineUser คืน user ID ในระบบของ LINE user (สร้างใหม่ถ้ายังไม่มี)
 func (s *Service) ResolveLineUser(ctx context.Context, lineUserID string) (string, error) {
+	if v, ok := s.lineUsers.Load(lineUserID); ok {
+		if c := v.(cachedUser); time.Now().Before(c.expires) {
+			return c.id, nil
+		}
+	}
 	u, err := s.userRepo.FindOrCreateByLineID(ctx, lineUserID, "")
 	if err != nil {
 		return "", fmt.Errorf("find or create user: %w", err)
 	}
+	s.lineUsers.Store(lineUserID, cachedUser{id: u.ID, expires: time.Now().Add(lineUserCacheTTL)})
 	return u.ID, nil
 }
 

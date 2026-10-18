@@ -17,13 +17,17 @@ const (
 	// prompt ภาษาไทย + tools ยาวเกิน context ค่าเริ่มต้นของ Ollama ได้ ซึ่งจะถูกตัดทิ้งแบบเงียบๆ
 	ollamaNumCtx     = 8192
 	ollamaNumPredict = 1024
+
+	// เก็บโมเดลไว้ใน GPU นานๆ: ถ้า Ollama unload ข้อความแรกหลังว่างนานต้องรอโหลดใหม่หลายวินาที
+	DefaultOllamaKeepAlive = "24h"
 )
 
 // OllamaProvider เรียก local model ผ่าน Ollama /api/chat (รองรับ tool calling)
 type OllamaProvider struct {
-	baseURL string
-	model   string
-	http    *http.Client
+	baseURL   string
+	model     string
+	keepAlive string
+	http      *http.Client
 }
 
 func NewOllamaProvider(baseURL, model string) *OllamaProvider {
@@ -33,7 +37,25 @@ func NewOllamaProvider(baseURL, model string) *OllamaProvider {
 	if model == "" {
 		model = DefaultOllamaModel
 	}
-	return &OllamaProvider{baseURL: strings.TrimRight(baseURL, "/"), model: model, http: http.DefaultClient}
+	return &OllamaProvider{baseURL: strings.TrimRight(baseURL, "/"), model: model, keepAlive: DefaultOllamaKeepAlive, http: http.DefaultClient}
+}
+
+// WithKeepAlive ตั้งเวลาที่ Ollama เก็บโมเดลไว้ในหน่วยความจำ เช่น "24h", "-1" (ตลอด); ว่าง = ค่าเริ่มต้น
+func (p *OllamaProvider) WithKeepAlive(d string) *OllamaProvider {
+	if d != "" {
+		p.keepAlive = d
+	}
+	return p
+}
+
+// Warmup โหลดโมเดลเข้า GPU และให้โมเดลประมวลผล system prompt + tools ไว้ล่วงหน้า
+// Ollama จำส่วนต้นของ prompt ที่เหมือนกันไว้ ข้อความแรกจริงจึงไม่ต้องประมวลผลส่วนนี้ใหม่
+// ไม่มีการรัน tool: คำตอบของโมเดลถูกทิ้ง
+func (p *OllamaProvider) Warmup(ctx context.Context, system string, tools []ToolSpec, userMessage string) error {
+	if _, err := p.Start(system, tools, userMessage).Next(ctx, nil, ""); err != nil {
+		return fmt.Errorf("ollama warmup: %w", err)
+	}
+	return nil
 }
 
 func (p *OllamaProvider) Name() string { return "ollama/" + p.model }
@@ -126,7 +148,7 @@ func (c *ollamaConversation) Next(ctx context.Context, results []ToolResult, fol
 		Stream:   false,
 		// ปิดโหมดคิดของ qwen3 ไม่งั้นช้ามากและเปลือง context
 		Think:     false,
-		KeepAlive: "30m",
+		KeepAlive: c.p.keepAlive,
 		Options: map[string]any{
 			"num_ctx":     ollamaNumCtx,
 			"num_predict": ollamaNumPredict,

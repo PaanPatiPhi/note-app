@@ -101,10 +101,13 @@ type Result struct {
 // error ที่คืนคือ error ของระบบ; กรณีโมเดลปฏิเสธหรือถึงขีดจำกัดจะคืน Result พร้อมข้อความสุภาพแทน
 func (a *Assistant) Handle(ctx context.Context, req Request) (*Result, error) {
 	now := a.now()
-	exec := &executor{store: a.store, userID: req.UserID, now: now}
+	exec := &executor{store: a.store, userID: req.UserID, now: now, userText: req.Text}
 	action := &Action{UserID: req.UserID, WebhookEventID: req.WebhookEventID, InputText: req.Text, Model: a.provider.Name()}
 
 	reply, runErr := a.run(ctx, req, exec, action, now)
+	if runErr == nil && needsReminderHint(req.Text, exec) && !strings.Contains(reply, reminderHint) {
+		reply += "\n" + reminderHint
+	}
 
 	action.ReplyText = reply
 	action.CreatedNoteIDs = exec.createdNoteIDs
@@ -117,14 +120,17 @@ func (a *Assistant) Handle(ctx context.Context, req Request) (*Result, error) {
 	res := &Result{Reply: reply, Wrote: exec.wrote()}
 	if a.actions != nil {
 		// บันทึกด้วย context ใหม่: ถ้า ctx หลักหมดเวลา ก็ยังอยากได้ log ไว้ทำ undo
+		logStart := time.Now()
 		logCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
 		id, err := a.actions.Insert(logCtx, action)
 		cancel()
+		action.timing.log = time.Since(logStart)
 		if err != nil {
 			log.Println("บันทึก ai_action ล้มเหลว:", err)
 		}
 		res.ActionID = id
 	}
+	log.Printf("AI timing (%s, %d rounds): %s", a.provider.Name(), len(action.timing.llm), action.timing)
 
 	if runErr != nil && !exec.wrote() {
 		return nil, runErr
@@ -138,7 +144,9 @@ func (a *Assistant) Handle(ctx context.Context, req Request) (*Result, error) {
 }
 
 func (a *Assistant) run(ctx context.Context, req Request, exec *executor, action *Action, now time.Time) (string, error) {
+	listsStart := time.Now()
 	openLists, err := a.store.ListOpenChecklistTitles(ctx, req.UserID, openListsInContext)
+	action.timing.lists = time.Since(listsStart)
 	if err != nil {
 		// ไม่ร้ายแรง: แค่โมเดลจะไม่รู้ชื่อลิสต์เดิม
 		log.Println("โหลดชื่อลิสต์ล้มเหลว:", err)
@@ -152,7 +160,9 @@ func (a *Assistant) run(ctx context.Context, req Request, exec *executor, action
 		nudges   int
 	)
 	for round := 0; round < maxRounds; round++ {
+		llmStart := time.Now()
 		turn, err := conv.Next(ctx, results, followUp)
+		action.timing.llm = append(action.timing.llm, time.Since(llmStart))
 		followUp = ""
 		if err != nil {
 			return fallbackReply, fmt.Errorf("%s request (round %d): %w", a.provider.Name(), round+1, err)
@@ -189,7 +199,9 @@ func (a *Assistant) run(ctx context.Context, req Request, exec *executor, action
 
 		results = results[:0]
 		for _, call := range turn.ToolCalls {
+			toolStart := time.Now()
 			run := a.runTool(ctx, exec, call)
+			action.timing.tools += time.Since(toolStart)
 			action.ToolCalls = append(action.ToolCalls, run)
 			results = append(results, ToolResult{
 				CallID: call.ID, Name: call.Name, Content: toolResultText(run), IsError: run.IsError,
@@ -246,4 +258,21 @@ func (a *Assistant) HandleLine(ctx context.Context, userID, webhookEventID, text
 		return "", err
 	}
 	return res.Reply, nil
+}
+
+// Warmup โหลดโมเดลล่วงหน้าถ้า provider รองรับ (เรียกตอน start server) ไม่งั้นไม่ทำอะไร
+func (a *Assistant) Warmup(ctx context.Context) error {
+	if w, ok := a.provider.(warmer); ok {
+		return w.Warmup(ctx, systemPrompt, toolSpecs(), buildUserMessage(a.now(), nil, "สวัสดี"))
+	}
+	return nil
+}
+
+// reminderHint บอกผู้ใช้ว่าต้องพิมพ์เวลาถ้าอยากให้เตือน (ใช้เมื่อขอให้เตือนแต่ไม่ได้บอกเวลา)
+const reminderHint = `ถ้าอยากให้เตือน พิมพ์บอกวันหรือเวลามาได้เลยครับ เช่น "เตือนซื้อพัดลม พรุ่งนี้ 9 โมง"`
+
+// needsReminderHint: ผู้ใช้ขอให้ "เตือน" แต่ไม่ได้บอกวัน/เวลา ระบบจึงจดเป็นโน้ตแทน
+// เติมคำแนะนำในโค้ดแทนการหวังให้โมเดลเล็กจำไปบอกเอง
+func needsReminderHint(text string, exec *executor) bool {
+	return strings.Contains(text, "เตือน") && !mentionsTime(text) && exec.savedNote && !exec.savedReminder
 }

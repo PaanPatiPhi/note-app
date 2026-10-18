@@ -501,3 +501,62 @@ func TestIsQuestion(t *testing.T) {
 		}
 	}
 }
+
+func TestReminderWithoutTimeBecomesNote(t *testing.T) {
+	store := newFakeStore()
+	llm := &fakeLLM{responses: []string{
+		// โมเดลแต่งเวลาเอง ทั้งที่ผู้ใช้ไม่ได้บอก
+		toolUseMsg("t1", "create_reminder", map[string]any{"text": "ซื้อพัดลมใหม่", "remind_at": "2026-10-15T18:00:00+07:00"}),
+		toolUseMsg("t2", "create_note", map[string]any{"content": "ซื้อพัดลมใหม่"}),
+		textMsg("📌 จดไว้แล้วครับ ถ้าอยากให้เตือน พิมพ์บอกเวลามาได้เลย"),
+	}}
+	a, _ := newTestAssistant(llm, store)
+
+	res := handle(t, a, "เตือนให้ซื้อพัดลมใหม่หน่อย")
+
+	if !strings.Contains(llm.requests[1], "did not say any date or time") {
+		t.Errorf("the invented reminder should be rejected with guidance, got %s", llm.requests[1])
+	}
+	if len(store.notes) != 1 || store.notes[0].Type != note.NoteTypeNote || store.notes[0].RemindAt != nil {
+		t.Fatalf("want exactly one plain note and no reminder, got %+v", store.notes)
+	}
+	if !res.Wrote {
+		t.Error("result should report the note write")
+	}
+	if !strings.HasSuffix(res.Reply, reminderHint) {
+		t.Errorf("reply should end with the reminder hint, got %q", res.Reply)
+	}
+}
+
+func TestMentionsTime(t *testing.T) {
+	for text, want := range map[string]bool{
+		"เตือนให้ซื้อพัดลมใหม่หน่อย": false,
+		"อย่าลืมโทรหาแม่":            false,
+		"ตีแบดกับเพื่อน":             false,
+		"พรุ่งนี้เตือนซื้อพัดลม":     true,
+		"เตือนจ่ายค่าไฟทุ่มนึง":      true,
+		"บ่ายสองไปรับลูก":            true,
+		"เตือนวันศุกร์ส่งงาน":        true,
+		"ประชุม 14:30":               true,
+		"นัดหมอ ๑๕ ต.ค.":             true,
+		"อีก 30 นาทีเตือนปิดเตา":     true,
+		"ตีห้าตื่นไปวิ่ง":            true,
+		"remind me tomorrow": true,
+		"เตือนให้กินยาก่อนนอนตอนเย็นๆ": true,
+	} {
+		if got := mentionsTime(text); got != want {
+			t.Errorf("mentionsTime(%q) = %v, want %v", text, got, want)
+		}
+	}
+}
+
+func TestReminderHintNotAddedWhenTimeGiven(t *testing.T) {
+	llm := &fakeLLM{responses: []string{
+		toolUseMsg("t1", "create_reminder", map[string]any{"text": "ซื้อพัดลม", "remind_at": "2026-10-16T09:00:00+07:00"}),
+		textMsg("⏰ ตั้งเตือนแล้วครับ"),
+	}}
+	a, _ := newTestAssistant(llm, newFakeStore())
+	if res := handle(t, a, "พรุ่งนี้ 9 โมงเตือนซื้อพัดลม"); strings.Contains(res.Reply, reminderHint) {
+		t.Errorf("hint must not be added when a reminder was set: %q", res.Reply)
+	}
+}

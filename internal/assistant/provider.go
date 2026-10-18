@@ -87,8 +87,13 @@ func ProviderFromEnv(getenv func(string) string) (Provider, error) {
 		client := anthropic.NewClient()
 		return NewClaudeProvider(&client.Messages, model), nil
 	case "", "ollama":
-		return NewOllamaProvider(getenv("OLLAMA_URL"), model), nil
+		return NewOllamaProvider(getenv("OLLAMA_URL"), model).WithKeepAlive(getenv("OLLAMA_KEEP_ALIVE")), nil
 	default:
 		return nil, fmt.Errorf("unknown AI_PROVIDER %q (use claude or ollama)", p)
 	}
+}
+
+// warmer คือ provider ที่โหลดโมเดลล่วงหน้าได้ (เช่น Ollama); Claude ไม่ต้องใช้
+type warmer interface {
+	Warmup(ctx context.Context, system string, tools []ToolSpec, userMessage string) error
 }

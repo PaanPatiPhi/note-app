@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -25,6 +27,8 @@ type Action struct {
 	InputTokens     int64
 	OutputTokens    int64
 	CacheReadTokens int64
+
+	timing timing
 }
 
 func (a *Action) addUsage(u Usage) {
@@ -90,4 +94,24 @@ func nonNil(ss []string) []string {
 		return []string{}
 	}
 	return ss
+}
+
+// timing เก็บเวลาที่ใช้แต่ละขั้น ไว้ log หาจุดที่ช้า (ไม่บันทึกลง DB)
+type timing struct {
+	lists time.Duration
+	llm   []time.Duration
+	tools time.Duration
+	log   time.Duration
+}
+
+func (t timing) String() string {
+	var total time.Duration
+	parts := make([]string, len(t.llm))
+	for i, d := range t.llm {
+		total += d
+		parts[i] = d.Round(time.Millisecond).String()
+	}
+	return fmt.Sprintf("lists=%s llm=%s [%s] tools=%s log=%s",
+		t.lists.Round(time.Millisecond), total.Round(time.Millisecond), strings.Join(parts, " "),
+		t.tools.Round(time.Millisecond), t.log.Round(time.Millisecond))
 }
