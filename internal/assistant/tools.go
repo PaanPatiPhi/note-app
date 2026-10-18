@@ -276,6 +276,7 @@ func (e *executor) createReminder(ctx context.Context, text, remindAt string) (a
 	if err != nil {
 		return nil, badInput("remind_at must be RFC3339, e.g. 2026-10-16T09:00:00+07:00")
 	}
+	at = correctClock(correctDay(at, e.userText, e.now), e.userText)
 	if at.Before(e.now.Add(-reminderPastTolerance)) {
 		return nil, badInput("remind_at %s is in the past (now is %s); ask the user for a future time",
 			at.In(bangkok).Format(time.RFC3339), e.now.Format(time.RFC3339))

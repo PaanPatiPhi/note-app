@@ -63,6 +63,7 @@ func TestLiveSmoke(t *testing.T) {
 		{"พรุ่งนี้ 9 โมงเตือนโทรหาหมอ", "create_reminder", at(tomorrow, 9)},
 		{"พรุ่งนี้บ่ายสองเตือนไปรับลูก", "create_reminder", at(tomorrow, 14)},
 		{"เตือนจ่ายค่าไฟพรุ่งนี้ทุ่มนึง", "create_reminder", at(tomorrow, 19)},
+		{"พรุ่งนี้สองทุ่มเตือนจ่ายค่าเน็ต", "create_reminder", at(tomorrow, 20)}, // โมเดลเคยตอบ 22:00
 		{"ซื้อนมแล้ว", "complete_items", time.Time{}},
 		{"อาทิตย์นี้มีนัดอะไรบ้าง", "list_agenda", time.Time{}},
 		{"ประชุม 3, 4, 5 คนมา", "create_note", time.Time{}},
