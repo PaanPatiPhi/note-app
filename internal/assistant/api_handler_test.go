@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 )
@@ -139,5 +140,54 @@ func TestAPIUndo(t *testing.T) {
 		if !strings.Contains(w.Body.String(), `"message"`) {
 			t.Errorf("response should carry a message: %s", w.Body)
 		}
+	}
+}
+
+type historyStub struct {
+	fakeActions
+	items     []HistoryItem
+	gotLimit  int
+	gotBefore *time.Time
+}
+
+func (s *historyStub) History(_ context.Context, _ string, limit int, before *time.Time) ([]HistoryItem, error) {
+	s.gotLimit, s.gotBefore = limit, before
+	return s.items, nil
+}
+
+func TestAPIHistory(t *testing.T) {
+	t0 := time.Date(2026, 10, 18, 9, 0, 0, 0, time.UTC)
+	stub := &historyStub{items: []HistoryItem{
+		{ID: "a", Text: "x", CreatedAt: t0},
+		{ID: "b", Text: "y", CreatedAt: t0.Add(time.Minute)},
+	}}
+	a := New(NewClaudeProvider(&fakeLLM{}, ""), newFakeStore(), stub)
+	r := newTestRouter(NewAPIHandler(a), "user-web")
+
+	w := doJSON(r, http.MethodGet, "/api/assistant/history?limit=2", "")
+	if w.Code != http.StatusOK || stub.gotLimit != 2 {
+		t.Fatalf("status = %d limit = %d body = %s", w.Code, stub.gotLimit, w.Body)
+	}
+	var res struct {
+		Items      []HistoryItem `json:"items"`
+		NextBefore *string       `json:"next_before"`
+	}
+	json.Unmarshal(w.Body.Bytes(), &res)
+	if len(res.Items) != 2 || res.NextBefore == nil || *res.NextBefore != t0.Format(time.RFC3339Nano) {
+		t.Errorf("response = %+v, next_before should be the oldest item when the page is full", res)
+	}
+
+	w = doJSON(r, http.MethodGet, "/api/assistant/history?limit=500&before="+t0.Format(time.RFC3339Nano), "")
+	if w.Code != http.StatusOK || stub.gotLimit != maxHistoryLimit || stub.gotBefore == nil || !stub.gotBefore.Equal(t0) {
+		t.Errorf("limit capped to %d? got %d; before = %v", maxHistoryLimit, stub.gotLimit, stub.gotBefore)
+	}
+
+	for _, q := range []string{"limit=0", "limit=x", "before=yesterday"} {
+		if w := doJSON(r, http.MethodGet, "/api/assistant/history?"+q, ""); w.Code != http.StatusBadRequest {
+			t.Errorf("%s: status = %d, want 400", q, w.Code)
+		}
+	}
+	if w := doJSON(newTestRouter(NewAPIHandler(a), ""), http.MethodGet, "/api/assistant/history", ""); w.Code != http.StatusUnauthorized {
+		t.Errorf("no auth: status = %d, want 401", w.Code)
 	}
 }

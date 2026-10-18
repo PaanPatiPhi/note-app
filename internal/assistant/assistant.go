@@ -55,6 +55,7 @@ type NoteStore interface {
 type ActionLogger interface {
 	Insert(ctx context.Context, a *Action) (string, error)
 	Undo(ctx context.Context, userID, actionID string) (*UndoResult, error)
+	History(ctx context.Context, userID string, limit int, before *time.Time) ([]HistoryItem, error)
 }
 
 // ตรวจตอน compile ว่าของจริง implement interface ครบ

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -220,4 +221,58 @@ func (r *ActionRepository) Undo(ctx context.Context, userID, actionID string) (*
 		return nil, fmt.Errorf("commit tx: %w", err)
 	}
 	return res, nil
+}
+
+// HistoryItem คือข้อความหนึ่งข้อความที่ผู้ใช้เคยสั่ง AI (จาก LINE หรือเว็บ) ใช้แสดงในหน้าแชท
+type HistoryItem struct {
+	ID        string     `json:"id"`
+	Text      string     `json:"text"`
+	Reply     string     `json:"reply"`
+	Channel   string     `json:"channel"` // "line" | "web"
+	CreatedAt time.Time  `json:"created_at"`
+	UndoneAt  *time.Time `json:"undone_at,omitempty"`
+	// Undoable = เคยเขียนข้อมูล, ยังไม่ถูกยกเลิก และยังอยู่ในเวลาที่ยกเลิกได้
+	Undoable bool `json:"undoable"`
+}
+
+// History คืนประวัติล่าสุดของ user เรียงจากเก่าไปใหม่ (ในหน้านั้น)
+// before = โหลดหน้าที่เก่ากว่าเวลานี้ (nil = ล่าสุด)
+func (r *ActionRepository) History(ctx context.Context, userID string, limit int, before *time.Time) ([]HistoryItem, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT id::text, input_text, coalesce(reply_text, ''),
+		       webhook_event_id IS NOT NULL,
+		       created_at, undone_at,
+		       cardinality(created_note_ids) > 0 OR cardinality(touched_item_ids) > 0
+		FROM ai_actions
+		WHERE user_id = $1 AND ($2::timestamptz IS NULL OR created_at < $2)
+		ORDER BY created_at DESC
+		LIMIT $3
+	`, userID, before, limit)
+	if err != nil {
+		return nil, fmt.Errorf("load history: %w", err)
+	}
+	defer rows.Close()
+
+	var items []HistoryItem
+	for rows.Next() {
+		var (
+			it       HistoryItem
+			fromLine bool
+			wrote    bool
+		)
+		if err := rows.Scan(&it.ID, &it.Text, &it.Reply, &fromLine, &it.CreatedAt, &it.UndoneAt, &wrote); err != nil {
+			return nil, fmt.Errorf("scan history: %w", err)
+		}
+		it.Channel = "web"
+		if fromLine {
+			it.Channel = "line"
+		}
+		it.Undoable = wrote && it.UndoneAt == nil && time.Since(it.CreatedAt) <= undoWindow
+		items = append(items, it)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	slices.Reverse(items) // หน้าแชทแสดงเก่าอยู่บน ใหม่อยู่ล่าง
+	return items, nil
 }

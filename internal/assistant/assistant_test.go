@@ -602,3 +602,7 @@ func TestUndoReplyText(t *testing.T) {
 		}
 	}
 }
+
+func (f *fakeActions) History(context.Context, string, int, *time.Time) ([]HistoryItem, error) {
+	return nil, nil
+}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -27,6 +28,7 @@ func NewAPIHandler(ai *Assistant) *APIHandler {
 func (h *APIHandler) RegisterRoutes(rg *gin.RouterGroup) {
 	rg.POST("/assistant/messages", h.message)
 	rg.POST("/assistant/actions/:id/undo", h.undo)
+	rg.GET("/assistant/history", h.history)
 }
 
 type messageRequest struct {
@@ -123,4 +125,58 @@ func (h *APIHandler) undo(c *gin.Context) {
 		"removed_items":  res.RemovedItems,
 		"restored_items": res.RestoredItems,
 	})
+}
+
+const (
+	defaultHistoryLimit = 30
+	maxHistoryLimit     = 100
+)
+
+// history: GET /api/assistant/history?limit=30&before=<RFC3339>
+// ประวัติที่สั่ง AI ทั้งจาก LINE และเว็บ เรียงเก่า→ใหม่; next_before ใช้โหลดหน้าที่เก่ากว่า (null = หมดแล้ว)
+func (h *APIHandler) history(c *gin.Context) {
+	userID := c.GetString("user_id")
+	if userID == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+		return
+	}
+	if h.ai == nil || h.ai.actions == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "assistant is disabled"})
+		return
+	}
+
+	limit := defaultHistoryLimit
+	if s := c.Query("limit"); s != "" {
+		n, err := strconv.Atoi(s)
+		if err != nil || n < 1 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid limit"})
+			return
+		}
+		limit = min(n, maxHistoryLimit)
+	}
+	var before *time.Time
+	if s := c.Query("before"); s != "" {
+		t, err := time.Parse(time.RFC3339Nano, s)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid before"})
+			return
+		}
+		before = &t
+	}
+
+	items, err := h.ai.actions.History(c.Request.Context(), userID, limit, before)
+	if err != nil {
+		log.Println("assistant history API ล้มเหลว:", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "history failed"})
+		return
+	}
+	if items == nil {
+		items = []HistoryItem{}
+	}
+	var next *string
+	if len(items) == limit {
+		s := items[0].CreatedAt.Format(time.RFC3339Nano)
+		next = &s
+	}
+	c.JSON(http.StatusOK, gin.H{"items": items, "next_before": next})
 }

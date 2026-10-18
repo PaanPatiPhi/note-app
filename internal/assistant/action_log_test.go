@@ -194,3 +194,60 @@ func TestActionRepositoryUndo(t *testing.T) {
 		t.Fatalf("second Undo = %+v, %v; want AlreadyUndone", res, err)
 	}
 }
+
+func TestActionRepositoryHistory(t *testing.T) {
+	pool := dbPool(t)
+	ctx := context.Background()
+	notes := note.NewRepository(pool)
+	actions := NewActionRepository(pool)
+	userID := dbUser(t, pool)
+	other := dbUser(t, pool)
+
+	content := "โน้ตจากเว็บ"
+	n := &note.Note{UserID: userID, Content: &content, Type: note.NoteTypeNote, Source: note.NoteSourceAI}
+	if err := notes.SaveNote(ctx, n); err != nil {
+		t.Fatal(err)
+	}
+	lineID, err := actions.Insert(ctx, &Action{UserID: userID, WebhookEventID: "evt-history-1", InputText: "ดูวันนี้มีอะไร", ReplyText: "ไม่มีครับ", Model: "test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	webID, err := actions.Insert(ctx, &Action{UserID: userID, InputText: "จดว่า x", ReplyText: "✅ จดแล้ว", Model: "test", CreatedNoteIDs: []string{n.ID}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := actions.Insert(ctx, &Action{UserID: other, InputText: "ของคนอื่น", Model: "test"}); err != nil {
+		t.Fatal(err)
+	}
+
+	items, err := actions.History(ctx, userID, 10, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 2 || items[0].ID != lineID || items[1].ID != webID {
+		t.Fatalf("history = %+v, want [line, web] oldest first and no other user's rows", items)
+	}
+	if items[0].Channel != "line" || items[0].Undoable {
+		t.Errorf("LINE read-only item = %+v, want channel line and not undoable", items[0])
+	}
+	if items[1].Channel != "web" || !items[1].Undoable || items[1].Reply != "✅ จดแล้ว" {
+		t.Errorf("web write item = %+v, want channel web and undoable", items[1])
+	}
+
+	if _, err := actions.Undo(ctx, userID, webID); err != nil {
+		t.Fatal(err)
+	}
+	items, _ = actions.History(ctx, userID, 10, nil)
+	if items[1].Undoable || items[1].UndoneAt == nil {
+		t.Errorf("after undo: %+v, want undone and not undoable", items[1])
+	}
+
+	page, _ := actions.History(ctx, userID, 1, nil)
+	if len(page) != 1 || page[0].ID != webID {
+		t.Fatalf("limit 1 = %+v, want the newest", page)
+	}
+	older, _ := actions.History(ctx, userID, 10, &page[0].CreatedAt)
+	if len(older) != 1 || older[0].ID != lineID {
+		t.Fatalf("before newest = %+v, want only the older one", older)
+	}
+}
