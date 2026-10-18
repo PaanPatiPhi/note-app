@@ -58,7 +58,7 @@ func toolSpecs() []ToolSpec {
 			},
 			"list_name", "items"),
 		tool("create_reminder",
-			"Create a reminder that JodJod will send to the user at a specific time.",
+			"Create a reminder that the assistant will send to the user at a specific time.",
 			map[string]any{
 				"text":      str("What to remind the user about."),
 				"remind_at": str("When to remind, RFC3339 with +07:00 offset, e.g. 2026-10-16T09:00:00+07:00."),

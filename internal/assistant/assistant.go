@@ -24,7 +24,7 @@ const (
 	openListsInContext = 10
 
 	fallbackReply = "ขอโทษครับ ตอนนี้ทำรายการไม่สำเร็จ ลองพิมพ์ใหม่อีกครั้งนะครับ"
-	refusalReply  = "ขอโทษครับ ข้อความนี้ JodJod ช่วยจัดการให้ไม่ได้ครับ"
+	refusalReply  = "ขอโทษครับ เรื่องนี้ผมช่วยจัดการให้ไม่ได้ครับ"
 )
 
 var bangkok = mustLoadBangkok()
