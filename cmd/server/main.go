@@ -63,7 +63,14 @@ func main() {
 	noteRepo := note.NewRepository(pool)
 	noteService := note.NewService(noteRepo, userRepo)
 
-	webhookHandler := note.NewHandler(noteService, bot, channelSecret, newAssistant(pool, noteRepo))
+	ai := newAssistant(pool, noteRepo)
+	// ส่ง *Assistant ที่เป็น nil เข้า interface ตรงๆ ไม่ได้ (จะได้ interface ที่ไม่ nil)
+	var lineAI note.Assistant
+	if ai != nil {
+		lineAI = ai
+	}
+	webhookHandler := note.NewHandler(noteService, bot, channelSecret, lineAI)
+	assistantAPIHandler := assistant.NewAPIHandler(ai)
 	noteAPIHandler := note.NewAPIHandler(noteService)
 	userAPIHandler := user.NewAPIHandler(userRepo)
 	authHandler := auth.NewHandler(userRepo, liffChannelID)
@@ -119,6 +126,9 @@ func main() {
 	subscriptionHandler.RegisterRoutes(protectedAPI)
 	adminHandler.RegisterRoutes(protectedAPI)
 
+	// AI assistant สำหรับเว็บ/แอป (ไม่ผ่าน LINE)
+	assistantAPIHandler.RegisterRoutes(protectedAPI)
+
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
@@ -172,7 +182,7 @@ func newPool(ctx context.Context, databaseURL string) (*pgxpool.Pool, error) {
 
 // newAssistant สร้าง AI ตาม AI_PROVIDER (ollama ค่าเริ่มต้น, claude, หรือ off)
 // คืน nil ถ้าปิดหรือตั้งค่าผิด → ทุกข้อความใน LINE ใช้คำสั่งแบบเดิม
-func newAssistant(pool *pgxpool.Pool, noteRepo *note.Repository) note.Assistant {
+func newAssistant(pool *pgxpool.Pool, noteRepo *note.Repository) *assistant.Assistant {
 	if strings.EqualFold(strings.TrimSpace(os.Getenv("AI_PROVIDER")), "off") {
 		log.Println("AI assistant: ปิด (AI_PROVIDER=off)")
 		return nil
