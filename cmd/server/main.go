@@ -19,6 +19,7 @@ import (
 	"github.com/line/line-bot-sdk-go/v8/linebot/messaging_api"
 
 	"jodjod/internal/admin"
+	"jodjod/internal/agenda"
 	"jodjod/internal/assistant"
 	"jodjod/internal/auth"
 	"jodjod/internal/feedback"
@@ -71,6 +72,12 @@ func main() {
 		ai.WithCalendar(googleCal)
 	}
 	integrationsHandler := integrations.NewHandler(googleCal, firstOrigin(webOrigin))
+	// ส่ง *Google ที่เป็น nil เข้า interface ตรงๆ ไม่ได้ (จะได้ interface ที่ไม่ nil)
+	var agendaCal agenda.Calendar
+	if googleCal != nil {
+		agendaCal = googleCal
+	}
+	agendaHandler := agenda.NewHandler(noteRepo, agendaCal)
 	// ส่ง *Assistant ที่เป็น nil เข้า interface ตรงๆ ไม่ได้ (จะได้ interface ที่ไม่ nil)
 	var lineAI note.Assistant
 	if ai != nil {
@@ -163,6 +170,9 @@ func main() {
 	// AI assistant สำหรับเว็บ/แอป (ไม่ผ่าน LINE)
 	assistantAPIHandler.RegisterRoutes(protectedAPI)
 	integrationsHandler.RegisterProtectedRoutes(protectedAPI)
+
+	// นัด/เตือนที่กำลังจะมาถึง (รวม Google Calendar) สำหรับหน้า LIFF และเว็บ
+	agendaHandler.RegisterRoutes(protectedAPI)
 
 	port := os.Getenv("PORT")
 	if port == "" {
