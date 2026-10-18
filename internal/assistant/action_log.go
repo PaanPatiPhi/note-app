@@ -27,6 +27,12 @@ type Action struct {
 	CreatedNoteIDs []string
 	AddedItemIDs   []string
 	ItemChanges    []itemChange
+	// event ใน Google Calendar ที่สร้าง (ลบตอนยกเลิก)
+	CalendarEventIDs []string
+	// นัดที่ถูกเลื่อน (ย้ายกลับเวลาเดิมตอนยกเลิก)
+	CalendarMoves []eventMove
+	// นัดที่ถูกลบ (สร้างกลับตอนยกเลิก)
+	CancelledEvents []cancelledEvent
 
 	InputTokens     int64
 	OutputTokens    int64
@@ -43,10 +49,13 @@ func (a *Action) addUsage(u Usage) {
 
 // actionDetails คือสิ่งที่เก็บใน tool_calls (jsonb) — รวมข้อมูลที่ต้องใช้ตอน undo
 type actionDetails struct {
-	Calls        []toolRun    `json:"calls"`
-	AddedItemIDs []string     `json:"added_item_ids,omitempty"`
-	ItemChanges  []itemChange `json:"item_changes,omitempty"`
-	Error        string       `json:"error,omitempty"`
+	Calls            []toolRun        `json:"calls"`
+	AddedItemIDs     []string         `json:"added_item_ids,omitempty"`
+	ItemChanges      []itemChange     `json:"item_changes,omitempty"`
+	CalendarEventIDs []string         `json:"calendar_event_ids,omitempty"`
+	CalendarMoves    []eventMove      `json:"calendar_moves,omitempty"`
+	CancelledEvents  []cancelledEvent `json:"cancelled_events,omitempty"`
+	Error            string           `json:"error,omitempty"`
 }
 
 type ActionRepository struct {
@@ -59,7 +68,9 @@ func NewActionRepository(pool *pgxpool.Pool) *ActionRepository {
 
 func (r *ActionRepository) Insert(ctx context.Context, a *Action) (string, error) {
 	details, err := json.Marshal(actionDetails{
-		Calls: a.ToolCalls, AddedItemIDs: a.AddedItemIDs, ItemChanges: a.ItemChanges, Error: a.Error,
+		Calls: a.ToolCalls, AddedItemIDs: a.AddedItemIDs, ItemChanges: a.ItemChanges,
+		CalendarEventIDs: a.CalendarEventIDs, CalendarMoves: a.CalendarMoves,
+		CancelledEvents: a.CancelledEvents, Error: a.Error,
 	})
 	if err != nil {
 		return "", fmt.Errorf("encode tool calls: %w", err)
@@ -134,6 +145,16 @@ type UndoResult struct {
 	DeletedNotes  int64 // โน้ต/ลิสต์/เตือน ที่ AI สร้าง แล้วถูกลบ
 	RemovedItems  int64 // item ที่ AI เพิ่มเข้าลิสต์เดิม แล้วถูกเอาออก
 	RestoredItems int64 // item ที่ AI ติ๊ก แล้วถูกคืนสถานะเดิม
+
+	// CalendarEventIDs คือ event ใน Google Calendar ที่ต้องลบ (Assistant.UndoAction ลบให้)
+	CalendarEventIDs []string
+	DeletedEvents    int
+	// CalendarMoves คือนัดที่ต้องย้ายกลับเวลาเดิม
+	CalendarMoves []eventMove
+	MovedBack     int
+	// CancelledEvents คือนัดที่ต้องสร้างกลับ
+	CancelledEvents []cancelledEvent
+	RecreatedEvents int
 }
 
 // Undo ย้อนทุกอย่างที่ ai_action นี้ทำ ภายใน transaction เดียว
@@ -214,6 +235,10 @@ func (r *ActionRepository) Undo(ctx context.Context, userID, actionID string) (*
 		res.DeletedNotes = tag.RowsAffected()
 	}
 
+	res.CalendarEventIDs = details.CalendarEventIDs
+	res.CalendarMoves = details.CalendarMoves
+	res.CancelledEvents = details.CancelledEvents
+
 	if _, err := tx.Exec(ctx, `UPDATE ai_actions SET undone_at = now() WHERE id = $1`, actionID); err != nil {
 		return nil, fmt.Errorf("mark undone: %w", err)
 	}
@@ -243,6 +268,9 @@ func (r *ActionRepository) History(ctx context.Context, userID string, limit int
 		       webhook_event_id IS NOT NULL,
 		       created_at, undone_at,
 		       cardinality(created_note_ids) > 0 OR cardinality(touched_item_ids) > 0
+		       OR jsonb_array_length(coalesce(tool_calls->'calendar_event_ids', '[]'::jsonb)) > 0
+		       OR jsonb_array_length(coalesce(tool_calls->'calendar_moves', '[]'::jsonb)) > 0
+		       OR jsonb_array_length(coalesce(tool_calls->'cancelled_events', '[]'::jsonb)) > 0
 		FROM ai_actions
 		WHERE user_id = $1 AND ($2::timestamptz IS NULL OR created_at < $2)
 		ORDER BY created_at DESC

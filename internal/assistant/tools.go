@@ -115,13 +115,23 @@ type executor struct {
 	savedNote     bool // มีการ create_note สำเร็จ
 	savedReminder bool // มีการ create_reminder สำเร็จ
 
+	// calendar = ปฏิทินของผู้ใช้ (nil ได้); calendarOn = ผู้ใช้เชื่อมไว้แล้ว
+	calendar   Calendar
+	calendarOn bool
+
 	createdNoteIDs []string
 	addedItemIDs   []string
 	itemChanges    []itemChange
+	// event ใน Google Calendar ที่สร้างในข้อความนี้ (ลบตอนกดยกเลิก)
+	calendarEventIDs []string
+	// นัดที่ถูกเลื่อนในข้อความนี้ (ย้ายกลับตอนกดยกเลิก)
+	calendarMoves []eventMove
+	// นัดที่ถูกลบในข้อความนี้ (สร้างกลับตอนกดยกเลิก)
+	cancelledEvents []cancelledEvent
 }
 
 func (e *executor) wrote() bool {
-	return len(e.createdNoteIDs) > 0 || len(e.addedItemIDs) > 0 || len(e.itemChanges) > 0
+	return len(e.createdNoteIDs) > 0 || len(e.addedItemIDs) > 0 || len(e.itemChanges) > 0 || len(e.calendarEventIDs) > 0 || len(e.calendarMoves) > 0 || len(e.cancelledEvents) > 0
 }
 
 // run เรียก tool ตามชื่อ; error ชนิด errToolInput คือ input ผิด ส่วน error อื่นคือระบบผิดพลาด
@@ -154,6 +164,10 @@ func (e *executor) run(ctx context.Context, name string, input json.RawMessage) 
 			return nil, badInput("invalid input: %v", err)
 		}
 		return e.createReminder(ctx, in.Text, in.RemindAt)
+	case "move_event":
+		return e.moveEvent(ctx, input)
+	case "cancel_event":
+		return e.cancelEvent(ctx, input)
 	case "complete_items":
 		var in struct {
 			Queries []string `json:"queries"`
@@ -180,6 +194,8 @@ func (e *executor) run(ctx context.Context, name string, input json.RawMessage) 
 			return nil, badInput("invalid input: %v", err)
 		}
 		return e.listAgenda(ctx, in.From, in.To)
+	case "create_event":
+		return e.createEvent(ctx, input)
 	default:
 		return nil, badInput("unknown tool %q", name)
 	}
@@ -287,7 +303,11 @@ func (e *executor) createReminder(ctx context.Context, text, remindAt string) (a
 	}
 	e.savedReminder = true
 	e.createdNoteIDs = append(e.createdNoteIDs, n.ID)
-	return map[string]any{"note_id": n.ID, "text": text, "remind_at": at.In(bangkok).Format(time.RFC3339), "when": thaiDateTime(at)}, nil
+	result := map[string]any{"note_id": n.ID, "text": text, "remind_at": at.In(bangkok).Format(time.RFC3339), "when": thaiDateTime(at)}
+	if e.calendarOn {
+		result["also_in_google_calendar"] = e.mirrorReminder(ctx, text, at)
+	}
+	return result, nil
 }
 
 type candidate struct {
@@ -448,6 +468,7 @@ func (e *executor) listAgenda(ctx context.Context, fromStr, toStr string) (any, 
 	if err != nil {
 		return nil, err
 	}
+	views = append(views, e.calendarAgenda(ctx, from, to.AddDate(0, 0, 1))...)
 	return map[string]any{"from": fromStr, "to": toStr, "count": len(views), "items": views}, nil
 }
 

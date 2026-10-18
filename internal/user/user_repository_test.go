@@ -139,7 +139,12 @@ func TestEmailRegistrationAndLaterLinking(t *testing.T) {
 		t.Fatalf("expected ErrEmailAlreadyRegistered, got: %v", err)
 	}
 
-	// 3. Connect Google later
+	// 3. Google login ด้วยอีเมลเดียวกันต้องไม่ถูกเชื่อมเข้าบัญชีนี้เอง (กันคนสมัครด้วยอีเมลของคนอื่นไว้ก่อน)
+	if _, err := repo.FindOrCreateByProvider(ctx, "google", testGoogleSub, testEmail, testName, ""); !errors.Is(err, ErrEmailAlreadyRegistered) {
+		t.Fatalf("google login with a registered email should be refused, got: %v", err)
+	}
+
+	// 4. Connect Google later (explicitly, while logged in)
 	err = repo.LinkIdentity(ctx, u.ID, "google", testGoogleSub, testEmail, testName, "")
 	if err != nil {
 		t.Fatalf("link Google later failed: %v", err)

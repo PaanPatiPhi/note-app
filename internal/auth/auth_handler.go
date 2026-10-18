@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/mail"
 	"os"
@@ -64,6 +65,22 @@ type googleLoginRequest struct {
 
 type lineLoginRequest struct {
 	IDToken string `json:"id_token"`
+}
+
+// imageExtensions คือชนิดรูปที่รับ (จาก http.DetectContentType) → นามสกุลที่ใช้บันทึก
+var imageExtensions = map[string]string{
+	"image/jpeg": ".jpg",
+	"image/png":  ".png",
+	"image/gif":  ".gif",
+	"image/webp": ".webp",
+}
+
+// verifiedEmail ใช้อีเมลจาก Google เฉพาะที่ Google ยืนยันแล้วเท่านั้น
+func verifiedEmail(g *GoogleIdentity) string {
+	if !g.EmailVerified {
+		return ""
+	}
+	return strings.ToLower(strings.TrimSpace(g.Email))
 }
 
 func (h *Handler) setSessionCookie(c *gin.Context, token string, maxAge int) {
@@ -202,13 +219,18 @@ func (h *Handler) loginWithGoogle(c *gin.Context) {
 		return
 	}
 
-	sub, email, name, picture, err := VerifyGoogleIDToken(c.Request.Context(), token)
+	g, err := VerifyGoogleToken(c.Request.Context(), token)
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "verify google token failed", "details": err.Error()})
+		log.Println("verify google token failed:", err)
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "verify google token failed"})
 		return
 	}
 
-	u, err := h.userRepo.FindOrCreateByProvider(c.Request.Context(), "google", sub, email, name, picture)
+	u, err := h.userRepo.FindOrCreateByProvider(c.Request.Context(), "google", g.Sub, verifiedEmail(g), g.Name, g.Picture)
+	if errors.Is(err, user.ErrEmailAlreadyRegistered) {
+		c.JSON(http.StatusConflict, gin.H{"error": "อีเมลนี้มีบัญชี JodJod อยู่แล้ว กรุณาเข้าสู่ระบบด้วยวิธีเดิม แล้วเชื่อม Google ที่หน้าบัญชี"})
+		return
+	}
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to process user account"})
 		return
@@ -249,7 +271,8 @@ func (h *Handler) loginWithLine(c *gin.Context) {
 
 	sub, name, picture, err := VerifyIDToken(c.Request.Context(), req.IDToken, h.liffChannelID)
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "verify line token failed", "details": err.Error()})
+		log.Println("verify line token failed:", err)
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "verify line token failed"})
 		return
 	}
 
@@ -352,7 +375,8 @@ func (h *Handler) linkLine(c *gin.Context) {
 
 	sub, name, picture, err := VerifyIDToken(c.Request.Context(), req.IDToken, h.liffChannelID)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid line token", "details": err.Error()})
+		log.Println("verify line token failed:", err)
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid line token"})
 		return
 	}
 
@@ -431,13 +455,14 @@ func (h *Handler) linkGoogle(c *gin.Context) {
 		return
 	}
 
-	sub, email, name, picture, err := VerifyGoogleIDToken(c.Request.Context(), token)
+	g, err := VerifyGoogleToken(c.Request.Context(), token)
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid google token", "details": err.Error()})
+		log.Println("verify google token failed:", err)
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid google token"})
 		return
 	}
 
-	err = h.userRepo.LinkIdentity(c.Request.Context(), userID, "google", sub, email, name, picture)
+	err = h.userRepo.LinkIdentity(c.Request.Context(), userID, "google", g.Sub, verifiedEmail(g), g.Name, g.Picture)
 	if err != nil {
 		if errors.Is(err, user.ErrIdentityAlreadyLinked) {
 			c.JSON(http.StatusConflict, gin.H{"error": "บัญชี Google นี้ถูกเชื่อมต่อกับบัญชี JodJod อื่นแล้ว"})
@@ -520,9 +545,16 @@ func (h *Handler) uploadAvatar(c *gin.Context) {
 		return
 	}
 
-	ext := strings.ToLower(filepath.Ext(header.Filename))
-	if ext != ".jpg" && ext != ".jpeg" && ext != ".png" && ext != ".webp" && ext != ".gif" {
+	// ดูชนิดไฟล์จากเนื้อไฟล์จริง ไม่เชื่อนามสกุลที่ผู้ใช้ตั้ง (กันไฟล์ HTML/สคริปต์ที่ตั้งชื่อเป็น .png)
+	head := make([]byte, 512)
+	n, _ := io.ReadFull(file, head)
+	ext, ok := imageExtensions[http.DetectContentType(head[:n])]
+	if !ok {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "รองรับเฉพาะไฟล์รูปภาพ .jpg, .jpeg, .png, .webp, .gif"})
+		return
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "อ่านไฟล์รูปภาพไม่สำเร็จ"})
 		return
 	}
 
@@ -574,6 +606,18 @@ func (h *Handler) updateProfile(c *gin.Context) {
 	var req updateProfileRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "ข้อมูลที่ส่งมาไม่ถูกต้อง"})
+		return
+	}
+
+	req.DisplayName = strings.TrimSpace(req.DisplayName)
+	req.AvatarURL = strings.TrimSpace(req.AvatarURL)
+	if len([]rune(req.DisplayName)) > 100 || len(req.AvatarURL) > 2048 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "ชื่อหรือลิงก์รูปยาวเกินไป"})
+		return
+	}
+	// รูปโปรไฟล์ต้องเป็นลิงก์ https หรือรูปที่อัปโหลดไว้ในระบบเท่านั้น (กัน javascript:, data: ฯลฯ)
+	if req.AvatarURL != "" && !strings.HasPrefix(req.AvatarURL, "https://") && !strings.HasPrefix(req.AvatarURL, "/uploads/avatars/") {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "ลิงก์รูปต้องขึ้นต้นด้วย https://"})
 		return
 	}
 

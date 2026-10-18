@@ -22,7 +22,9 @@ import (
 	"jodjod/internal/assistant"
 	"jodjod/internal/auth"
 	"jodjod/internal/feedback"
+	"jodjod/internal/integrations"
 	"jodjod/internal/note"
+	"jodjod/internal/ratelimit"
 	"jodjod/internal/subscription"
 	"jodjod/internal/user"
 )
@@ -64,6 +66,11 @@ func main() {
 	noteService := note.NewService(noteRepo, userRepo)
 
 	ai := newAssistant(pool, noteRepo)
+	googleCal := newGoogleCalendar(pool)
+	if ai != nil && googleCal != nil {
+		ai.WithCalendar(googleCal)
+	}
+	integrationsHandler := integrations.NewHandler(googleCal, firstOrigin(webOrigin))
 	// ส่ง *Assistant ที่เป็น nil เข้า interface ตรงๆ ไม่ได้ (จะได้ interface ที่ไม่ nil)
 	var lineAI note.Assistant
 	if ai != nil {
@@ -81,9 +88,35 @@ func main() {
 	adminHandler := admin.NewHandler(userRepo, feedbackRepo, subscriptionRepo, noteRepo)
 
 	r := gin.Default()
+	production := os.Getenv("ENV") == "production"
 
-	// ตั้งค่า CORS ให้รองรับทั้ง webOrigin, localhost dev และส่ง Cookie ได้
-	allowedOrigins := []string{"http://localhost:3000", "http://localhost:3001", "http://127.0.0.1:3000"}
+	// ค่าเริ่มต้นของ gin เชื่อ X-Forwarded-For จากทุกคน → ใครก็ปลอม IP หลบ rate limit ได้
+	// ตั้ง TRUSTED_PROXIES (คั่นด้วย comma) เฉพาะตอนอยู่หลัง proxy/load balancer ที่รู้จัก
+	if err := r.SetTrustedProxies(splitList(os.Getenv("TRUSTED_PROXIES"))); err != nil {
+		log.Fatal("TRUSTED_PROXIES ไม่ถูกต้อง:", err)
+	}
+	r.MaxMultipartMemory = 6 << 20
+	r.Use(securityHeaders(production))
+	r.Use(ratelimit.BodyLimit(1<<20, map[string]int64{"/api/auth/avatar": 6 << 20}))
+	r.Use(ratelimit.New(map[string]ratelimit.Rule{
+		"POST /api/auth/login":    {Limit: 10, Window: time.Minute},
+		"POST /api/auth/register": {Limit: 5, Window: time.Minute},
+		"POST /api/auth/google":   {Limit: 20, Window: time.Minute},
+		"POST /api/auth/line":     {Limit: 20, Window: time.Minute},
+	}).ByIP())
+	userLimits := ratelimit.New(map[string]ratelimit.Rule{
+		"POST /api/assistant/messages":          {Limit: 20, Window: time.Minute},
+		"POST /api/feedback":                    {Limit: 5, Window: time.Minute},
+		"POST /api/auth/avatar":                 {Limit: 10, Window: time.Minute},
+		"POST /api/integrations/google/connect": {Limit: 10, Window: time.Minute},
+		"POST /api/assistant/actions/:id/undo":  {Limit: 30, Window: time.Minute},
+	}).ByUser()
+
+	// ตั้งค่า CORS: localhost ใช้ได้เฉพาะตอน dev, production อนุญาตเฉพาะ WEB_ORIGIN
+	var allowedOrigins []string
+	if !production {
+		allowedOrigins = []string{"http://localhost:3000", "http://localhost:3001", "http://127.0.0.1:3000"}
+	}
 	if webOrigin != "" {
 		for _, o := range strings.Split(webOrigin, ",") {
 			o = strings.TrimSpace(o)
@@ -112,9 +145,10 @@ func main() {
 	// Public Auth Endpoints (ล็อกอินไม่ต้องมี token ก่อน)
 	publicAPI := r.Group("/api")
 	authHandler.RegisterPublicRoutes(publicAPI)
+	integrationsHandler.RegisterPublicRoutes(publicAPI)
 
 	// Protected REST API — รองรับทั้ง Session Cookie, Bearer JWT, และ LINE ID Token (LIFF)
-	protectedAPI := r.Group("/api", auth.RequireAuth(userRepo, liffChannelID))
+	protectedAPI := r.Group("/api", auth.RequireAuth(userRepo, liffChannelID), userLimits)
 	authHandler.RegisterProtectedRoutes(protectedAPI)
 	noteAPIHandler.RegisterRoutes(protectedAPI)
 	userAPIHandler.RegisterRoutes(protectedAPI)
@@ -128,6 +162,7 @@ func main() {
 
 	// AI assistant สำหรับเว็บ/แอป (ไม่ผ่าน LINE)
 	assistantAPIHandler.RegisterRoutes(protectedAPI)
+	integrationsHandler.RegisterProtectedRoutes(protectedAPI)
 
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -207,4 +242,73 @@ func newAssistant(pool *pgxpool.Pool, noteRepo *note.Repository) *assistant.Assi
 		log.Printf("AI warmup เสร็จใน %s", time.Since(start).Round(time.Millisecond))
 	}()
 	return ai
+}
+
+// newGoogleCalendar เปิดการเชื่อม Google Calendar เมื่อตั้งค่าครบ ไม่งั้นคืน nil (ปุ่มเชื่อมบนเว็บจะบอกว่ายังไม่พร้อม)
+// ต้องมี GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET และ INTEGRATIONS_KEY (สร้างด้วย `openssl rand -base64 32`)
+func newGoogleCalendar(pool *pgxpool.Pool) *integrations.Google {
+	clientID := strings.TrimSpace(os.Getenv("GOOGLE_CLIENT_ID"))
+	secret := strings.TrimSpace(os.Getenv("GOOGLE_CLIENT_SECRET"))
+	key := strings.TrimSpace(os.Getenv("INTEGRATIONS_KEY"))
+	var missing []string
+	for name, v := range map[string]string{"GOOGLE_CLIENT_ID": clientID, "GOOGLE_CLIENT_SECRET": secret, "INTEGRATIONS_KEY": key} {
+		if v == "" {
+			missing = append(missing, name)
+		}
+	}
+	if len(missing) > 0 {
+		log.Println("Google Calendar: ปิด (ยังไม่ได้ตั้ง", strings.Join(missing, ", ")+")")
+		return nil
+	}
+	sealer, err := integrations.NewSealer(key)
+	if err != nil {
+		log.Println("Google Calendar: ปิด เพราะ", err)
+		return nil
+	}
+	redirect := strings.TrimSpace(os.Getenv("GOOGLE_REDIRECT_URL"))
+	if redirect == "" {
+		port := os.Getenv("PORT")
+		if port == "" {
+			port = "8080"
+		}
+		redirect = "http://localhost:" + port + "/api/integrations/google/callback"
+	}
+	log.Println("Google Calendar: เปิด (redirect", redirect+")")
+	return integrations.NewGoogle(integrations.GoogleConfig{ClientID: clientID, ClientSecret: secret, RedirectURL: redirect},
+		integrations.NewRepository(pool, sealer), sealer)
+}
+
+// securityHeaders ใส่ header พื้นฐานกันการเดาชนิดไฟล์ (เช่น รูปที่อัปโหลดถูกเปิดเป็น HTML) และกันฝังหน้าใน iframe
+func securityHeaders(production bool) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		h := c.Writer.Header()
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("X-Frame-Options", "DENY")
+		h.Set("Referrer-Policy", "strict-origin-when-cross-origin")
+		h.Set("Content-Security-Policy", "default-src 'none'; img-src 'self'; frame-ancestors 'none'")
+		if production {
+			h.Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+		}
+		c.Next()
+	}
+}
+
+func splitList(s string) []string {
+	var out []string
+	for _, p := range strings.Split(s, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// firstOrigin คืน origin แรกของ WEB_ORIGIN (คั่นด้วย comma) ใช้เป็นหน้าที่พากลับหลังเชื่อมบริการ
+func firstOrigin(webOrigin string) string {
+	for _, o := range strings.Split(webOrigin, ",") {
+		if o = strings.TrimSpace(o); o != "" {
+			return strings.TrimRight(o, "/")
+		}
+	}
+	return "http://localhost:3000"
 }

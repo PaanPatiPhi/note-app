@@ -1,6 +1,7 @@
 package assistant
 
 import (
+	"regexp"
 	"strings"
 	"unicode"
 )
@@ -33,6 +34,32 @@ func mentionsTime(text string) bool {
 		}
 	}
 	for _, w := range timeWords {
+		if strings.Contains(lower, w) {
+			return true
+		}
+	}
+	return false
+}
+
+// dayWords คือคำที่บอกวัน (ไม่รวมคำบอกเวลาในวัน) ใช้ตอนเลื่อนนัด: ไม่บอกวันใหม่ = อยู่วันเดิม
+var dayWords = []string{
+	"วันนี้", "คืนนี้", "พรุ่งนี้", "มะรืน", "วันที่",
+	"จันทร์", "อังคาร", "พุธ", "พฤหัส", "ศุกร์", "เสาร์", "อาทิตย์",
+	"สัปดาห์", "เดือน", "ปีหน้า",
+	"มกรา", "กุมภา", "มีนา", "เมษา", "พฤษภา", "มิถุนา", "กรกฎา", "สิงหา", "กันยา", "ตุลา", "พฤศจิกา", "ธันวา",
+	"ม.ค.", "ก.พ.", "มี.ค.", "เม.ย.", "พ.ค.", "มิ.ย.", "ก.ค.", "ส.ค.", "ก.ย.", "ต.ค.", "พ.ย.", "ธ.ค.",
+	"today", "tonight", "tomorrow", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday", "week", "month",
+}
+
+var numericDate = regexp.MustCompile(`[0-9๐-๙]{1,2}\s*/\s*[0-9๐-๙]{1,2}`)
+
+// mentionsDay บอกว่าข้อความระบุวัน (เช่น "พรุ่งนี้", "ศุกร์", "25/10") หรือไม่
+func mentionsDay(text string) bool {
+	lower := strings.ToLower(text)
+	if numericDate.MatchString(lower) {
+		return true
+	}
+	for _, w := range dayWords {
 		if strings.Contains(lower, w) {
 			return true
 		}

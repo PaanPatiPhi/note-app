@@ -172,30 +172,16 @@ func (r *Repository) FindOrCreateByProvider(ctx context.Context, provider, provi
 		return nil, fmt.Errorf("find identity: %w", err)
 	}
 
-	// 2. ถ้ามี email ลองหาดูว่ามี User เดิมที่มี email ตรงกันไหม (สำหรับ account linking แบบ implicit)
+	// 2. ถ้ามีบัญชีที่ใช้อีเมลนี้อยู่แล้ว ห้ามเชื่อมให้อัตโนมัติ
+	// การสมัครด้วยอีเมลไม่ได้ยืนยันว่าเป็นเจ้าของอีเมลจริง ถ้าเชื่อมอัตโนมัติ คนที่สมัครด้วยอีเมลของเหยื่อไว้ก่อน
+	// จะได้บัญชีของเหยื่อตอนเหยื่อ login ด้วย Google ครั้งแรก → ให้ login วิธีเดิมแล้วเชื่อมเองที่หน้าบัญชี
 	if email != "" {
 		existingUser, err := r.FindByEmail(ctx, email)
-		if err == nil && existingUser != nil {
-			// มี user เดิมอยู่แล้ว เชื่อม identity ใหม่เข้ากับ user เดิม
-			_, err = r.pool.Exec(ctx, `
-				INSERT INTO user_identities (user_id, provider, provider_user_id, email, display_name, avatar_url)
-				VALUES ($1, $2, $3, $4, $5, $6)
-				ON CONFLICT (provider, provider_user_id) DO NOTHING
-			`, existingUser.ID, provider, providerUserID, email, displayName, avatarURL)
-			if err != nil {
-				return nil, fmt.Errorf("link identity to existing user: %w", err)
-			}
-
-			// ถ้าไม่มีรูปโปรไฟล์ ให้ใช้รูปของ provider นี้
-			if avatarURL != "" {
-				_, _ = r.pool.Exec(ctx, `
-					UPDATE users
-					SET avatar_url = $1, updated_at = NOW()
-					WHERE id = $2 AND (avatar_url IS NULL OR avatar_url = '')
-				`, avatarURL, existingUser.ID)
-			}
-
-			return r.FindByID(ctx, existingUser.ID)
+		if err != nil {
+			return nil, fmt.Errorf("find user by email: %w", err)
+		}
+		if existingUser != nil {
+			return nil, ErrEmailAlreadyRegistered
 		}
 	}
 

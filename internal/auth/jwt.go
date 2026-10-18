@@ -3,7 +3,6 @@ package auth
 import (
 	"errors"
 	"fmt"
-	"log"
 	"os"
 	"time"
 
@@ -19,27 +18,27 @@ type Claims struct {
 	jwt.RegisteredClaims
 }
 
-// devJWTSecret ใช้เฉพาะตอน dev เท่านั้น ค่านี้อยู่ใน source code จึงไม่ใช่ความลับ
-const devJWTSecret = "jodjod-dev-secret-key-change-in-production-2026"
+// minJWTSecretLen: secret สั้นเดาได้ด้วยการลองรัวๆ แบบ offline จาก token ที่มีอยู่ในมือ
+const minJWTSecretLen = 32
 
-func getJWTSecret() []byte {
+var errNoJWTSecret = errors.New("JWT_SECRET is not set")
+
+// getJWTSecret ไม่มีค่า fallback: ถ้าไม่ได้ตั้ง JWT_SECRET จะออก/ตรวจ token ไม่ได้เลย
+// (เดิมมี dev secret อยู่ใน source code ใครอ่านโค้ดก็ปลอม token เป็นใครก็ได้)
+func getJWTSecret() ([]byte, error) {
 	secret := os.Getenv("JWT_SECRET")
-	if secret == "" {
-		return []byte(devJWTSecret)
+	if len(secret) < minJWTSecretLen {
+		return nil, errNoJWTSecret
 	}
-	return []byte(secret)
+	return []byte(secret), nil
 }
 
-// CheckJWTConfig เรียกตอน start server: production ต้องตั้ง JWT_SECRET เสมอ
-// ไม่งั้นใครก็ปลอม session token ได้ด้วย devJWTSecret ที่อยู่ใน source code
+// CheckJWTConfig เรียกตอน start server: ต้องตั้ง JWT_SECRET ยาวอย่างน้อย 32 ตัวอักษรเสมอ
+// สร้างด้วย `openssl rand -base64 48`
 func CheckJWTConfig() error {
-	if os.Getenv("JWT_SECRET") != "" {
-		return nil
+	if len(os.Getenv("JWT_SECRET")) < minJWTSecretLen {
+		return fmt.Errorf("JWT_SECRET must be set and at least %d characters (generate one with: openssl rand -base64 48)", minJWTSecretLen)
 	}
-	if os.Getenv("ENV") == "production" {
-		return errors.New("JWT_SECRET is required when ENV=production")
-	}
-	log.Println("คำเตือน: ไม่ได้ตั้ง JWT_SECRET ใช้ dev secret แทน (ห้ามใช้ใน production)")
 	return nil
 }
 
@@ -56,8 +55,12 @@ func GenerateSessionToken(userID string) (string, time.Time, error) {
 		},
 	}
 
+	secret, err := getJWTSecret()
+	if err != nil {
+		return "", time.Time{}, err
+	}
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-	tokenString, err := token.SignedString(getJWTSecret())
+	tokenString, err := token.SignedString(secret)
 	if err != nil {
 		return "", time.Time{}, fmt.Errorf("sign jwt: %w", err)
 	}
@@ -66,12 +69,13 @@ func GenerateSessionToken(userID string) (string, time.Time, error) {
 
 // ValidateSessionToken ตรวจสอบความถูกต้องของ JWT token
 func ValidateSessionToken(tokenString string) (*Claims, error) {
+	secret, err := getJWTSecret()
+	if err != nil {
+		return nil, ErrInvalidToken
+	}
 	token, err := jwt.ParseWithClaims(tokenString, &Claims{}, func(t *jwt.Token) (interface{}, error) {
-		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
-			return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
-		}
-		return getJWTSecret(), nil
-	})
+		return secret, nil
+	}, jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}), jwt.WithIssuer("jodjod-api"), jwt.WithExpirationRequired())
 
 	if err != nil {
 		return nil, ErrInvalidToken

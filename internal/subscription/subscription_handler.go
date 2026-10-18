@@ -58,6 +58,12 @@ func (h *Handler) Subscribe(c *gin.Context) {
 	if req.Tier != "free" && req.Tier != "premium" {
 		req.Tier = "premium"
 	}
+	// ยังไม่มีระบบรับเงินจริง: ถ้าให้สมัคร premium ผ่าน endpoint นี้ได้ ใครก็กดเป็น premium ฟรีได้
+	// ระหว่างนี้ admin ให้ premium ผ่าน /api/admin/users/:id/tier แทน
+	if req.Tier == "premium" {
+		c.JSON(http.StatusPaymentRequired, gin.H{"error": "ยังไม่เปิดรับชำระเงิน ติดต่อผู้ดูแลระบบเพื่อเปิด Premium"})
+		return
+	}
 	if req.BillingCycle == "" {
 		req.BillingCycle = "monthly"
 	}

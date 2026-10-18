@@ -106,7 +106,7 @@ func (h *APIHandler) undo(c *gin.Context) {
 		return
 	}
 
-	res, err := h.ai.actions.Undo(c.Request.Context(), userID, c.Param("id"))
+	res, err := h.ai.UndoAction(c.Request.Context(), userID, c.Param("id"))
 	if err != nil {
 		log.Println("assistant undo API ล้มเหลว:", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "undo failed"})
@@ -120,10 +120,13 @@ func (h *APIHandler) undo(c *gin.Context) {
 		status = http.StatusConflict
 	}
 	c.JSON(status, gin.H{
-		"message":        undoReplyText(res),
-		"deleted_notes":  res.DeletedNotes,
-		"removed_items":  res.RemovedItems,
-		"restored_items": res.RestoredItems,
+		"message":           undoReplyText(res),
+		"deleted_notes":     res.DeletedNotes,
+		"removed_items":     res.RemovedItems,
+		"restored_items":    res.RestoredItems,
+		"deleted_events":    res.DeletedEvents,
+		"moved_back_events": res.MovedBack,
+		"recreated_events":  res.RecreatedEvents,
 	})
 }
 

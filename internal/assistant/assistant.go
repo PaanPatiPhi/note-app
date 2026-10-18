@@ -71,6 +71,7 @@ type Assistant struct {
 	provider Provider
 	store    NoteStore
 	actions  ActionLogger
+	calendar Calendar // nil = ไม่ได้ตั้งค่า Google Calendar
 	now      func() time.Time
 }
 
@@ -103,7 +104,14 @@ type Result struct {
 // error ที่คืนคือ error ของระบบ; กรณีโมเดลปฏิเสธหรือถึงขีดจำกัดจะคืน Result พร้อมข้อความสุภาพแทน
 func (a *Assistant) Handle(ctx context.Context, req Request) (*Result, error) {
 	now := a.now()
-	exec := &executor{store: a.store, userID: req.UserID, now: now, userText: req.Text}
+	exec := &executor{store: a.store, userID: req.UserID, now: now, userText: req.Text, calendar: a.calendar}
+	if a.calendar != nil {
+		on, err := a.calendar.Connected(ctx, req.UserID)
+		if err != nil {
+			log.Println("เช็คการเชื่อม Google Calendar ล้มเหลว:", err)
+		}
+		exec.calendarOn = on
+	}
 	action := &Action{UserID: req.UserID, WebhookEventID: req.WebhookEventID, InputText: req.Text, Model: a.provider.Name()}
 
 	reply, runErr := a.run(ctx, req, exec, action, now)
@@ -115,6 +123,9 @@ func (a *Assistant) Handle(ctx context.Context, req Request) (*Result, error) {
 	action.CreatedNoteIDs = exec.createdNoteIDs
 	action.AddedItemIDs = exec.addedItemIDs
 	action.ItemChanges = exec.itemChanges
+	action.CalendarEventIDs = exec.calendarEventIDs
+	action.CalendarMoves = exec.calendarMoves
+	action.CancelledEvents = exec.cancelledEvents
 	if runErr != nil {
 		action.Error = runErr.Error()
 	}
@@ -154,7 +165,7 @@ func (a *Assistant) run(ctx context.Context, req Request, exec *executor, action
 		log.Println("โหลดชื่อลิสต์ล้มเหลว:", err)
 	}
 
-	conv := a.provider.Start(systemPrompt, toolSpecs(), buildUserMessage(now, openLists, req.Text))
+	conv := a.provider.Start(systemPrompt, toolsFor(exec.calendarOn), buildUserMessage(now, openLists, req.Text))
 
 	var (
 		results  []ToolResult
@@ -264,14 +275,26 @@ func (a *Assistant) HandleLine(ctx context.Context, userID, webhookEventID, text
 
 // Undo ย้อนสิ่งที่ AI ทำใน action นั้น (จากปุ่มยกเลิกใน LINE) แล้วคืนข้อความตอบผู้ใช้
 func (a *Assistant) Undo(ctx context.Context, userID, actionID string) (string, error) {
-	if a.actions == nil {
-		return "", errors.New("action log is not configured")
-	}
-	res, err := a.actions.Undo(ctx, userID, actionID)
+	res, err := a.UndoAction(ctx, userID, actionID)
 	if err != nil {
 		return "", err
 	}
 	return undoReplyText(res), nil
+}
+
+// UndoAction ย้อนข้อมูลในระบบ แล้วลบนัดใน Google Calendar ที่ action นั้นสร้างไว้
+func (a *Assistant) UndoAction(ctx context.Context, userID, actionID string) (*UndoResult, error) {
+	if a.actions == nil {
+		return nil, errors.New("action log is not configured")
+	}
+	res, err := a.actions.Undo(ctx, userID, actionID)
+	if err != nil {
+		return nil, err
+	}
+	res.DeletedEvents = a.deleteCalendarEvents(ctx, userID, res.CalendarEventIDs)
+	res.MovedBack = a.restoreCalendarMoves(ctx, userID, res.CalendarMoves)
+	res.RecreatedEvents = a.restoreCancelledEvents(ctx, userID, res.CancelledEvents)
+	return res, nil
 }
 
 func undoReplyText(r *UndoResult) string {
@@ -292,6 +315,15 @@ func undoReplyText(r *UndoResult) string {
 	}
 	if r.RestoredItems > 0 {
 		parts = append(parts, fmt.Sprintf("คืนสถานะติ๊ก %d รายการ", r.RestoredItems))
+	}
+	if r.DeletedEvents > 0 {
+		parts = append(parts, fmt.Sprintf("ลบนัดใน Google Calendar %d รายการ", r.DeletedEvents))
+	}
+	if r.MovedBack > 0 {
+		parts = append(parts, fmt.Sprintf("ย้ายนัดกลับเวลาเดิม %d รายการ", r.MovedBack))
+	}
+	if r.RecreatedEvents > 0 {
+		parts = append(parts, fmt.Sprintf("คืนนัดที่ลบไปใน Google Calendar %d รายการ", r.RecreatedEvents))
 	}
 	if len(parts) == 0 {
 		return "↩️ ยกเลิกแล้วครับ (ข้อมูลถูกลบหรือแก้ไปก่อนหน้านี้แล้ว)"
