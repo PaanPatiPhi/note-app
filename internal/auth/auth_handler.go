@@ -20,12 +20,14 @@ import (
 type Handler struct {
 	userRepo      *user.Repository
 	liffChannelID string
+	handoffs      *handoffStore
 }
 
 func NewHandler(userRepo *user.Repository, liffChannelID string) *Handler {
 	return &Handler{
 		userRepo:      userRepo,
 		liffChannelID: liffChannelID,
+		handoffs:      newHandoffStore(),
 	}
 }
 
@@ -35,6 +37,7 @@ func (h *Handler) RegisterPublicRoutes(rg *gin.RouterGroup) {
 	rg.POST("/auth/google", h.loginWithGoogle)
 	rg.POST("/auth/line", h.loginWithLine)
 	rg.POST("/auth/logout", h.logout)
+	rg.POST("/auth/handoff/exchange", h.exchangeHandoff)
 }
 
 func (h *Handler) RegisterProtectedRoutes(rg *gin.RouterGroup) {
@@ -45,6 +48,9 @@ func (h *Handler) RegisterProtectedRoutes(rg *gin.RouterGroup) {
 	rg.POST("/auth/unlink/line", h.unlinkLine)
 	rg.POST("/auth/link/google", h.linkGoogle)
 	rg.POST("/auth/unlink/google", h.unlinkGoogle)
+	rg.POST("/auth/link/email", h.linkEmail)
+	rg.POST("/auth/password", h.changePassword)
+	rg.POST("/auth/handoff", h.createHandoff)
 }
 
 type emailRegisterRequest struct {
