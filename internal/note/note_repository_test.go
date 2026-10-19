@@ -189,3 +189,57 @@ func TestOpenChecklistAppendAndAgenda(t *testing.T) {
 		t.Fatalf("FindAgenda = %d notes, want only the 16/10 reminder", len(agenda))
 	}
 }
+
+func TestPinnedFeed(t *testing.T) {
+	pool := getTestPool(t)
+
+	ctx := context.Background()
+	repo := NewRepository(pool)
+	userID := createTestUser(t, pool)
+
+	save := func(text string) *Note {
+		n := &Note{UserID: userID, Content: &text, Type: NoteTypeNote, Source: NoteSourceWeb}
+		if err := repo.SaveNote(ctx, n); err != nil {
+			t.Fatalf("SaveNote: %v", err)
+		}
+		return n
+	}
+	pinned := save("ปักไว้")
+	save("ไม่ได้ปัก")
+
+	if err := repo.SetPinned(ctx, userID, pinned.ID, true); err != nil {
+		t.Fatalf("SetPinned: %v", err)
+	}
+	first, _ := repo.FindByUserAndID(ctx, userID, pinned.ID)
+	if first.PinnedAt == nil {
+		t.Fatal("PinnedAt = nil after pinning")
+	}
+	// ปักซ้ำต้องไม่เลื่อนเวลาที่ปักไว้
+	if err := repo.SetPinned(ctx, userID, pinned.ID, true); err != nil {
+		t.Fatalf("SetPinned again: %v", err)
+	}
+	again, _ := repo.FindByUserAndID(ctx, userID, pinned.ID)
+	if again.PinnedAt == nil || !again.PinnedAt.Equal(*first.PinnedAt) {
+		t.Errorf("PinnedAt moved on re-pin: %v -> %v", first.PinnedAt, again.PinnedAt)
+	}
+
+	got, err := repo.FindFeed(ctx, FeedQuery{UserID: userID, Desc: true, Limit: 10, PinnedOnly: true})
+	if err != nil {
+		t.Fatalf("FindFeed: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != pinned.ID {
+		t.Fatalf("pinned feed = %d notes, want only %s", len(got), pinned.ID)
+	}
+
+	if err := repo.SetPinned(ctx, userID, pinned.ID, false); err != nil {
+		t.Fatalf("unpin: %v", err)
+	}
+	got, _ = repo.FindFeed(ctx, FeedQuery{UserID: userID, Desc: true, Limit: 10, PinnedOnly: true})
+	if len(got) != 0 {
+		t.Errorf("pinned feed after unpin = %d notes, want 0", len(got))
+	}
+
+	if err := repo.SetPinned(ctx, "00000000-0000-0000-0000-000000000000", pinned.ID, true); err == nil {
+		t.Error("SetPinned by another user succeeded, want error")
+	}
+}

@@ -4,6 +4,7 @@ package assistant
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -46,6 +47,8 @@ type NoteStore interface {
 	AppendItems(ctx context.Context, userID, noteID string, items []string) ([]*note.NoteItem, error)
 	FindItemsBySimilarText(ctx context.Context, userID, query string, limit int) ([]*note.ItemMatch, error)
 	SetItemDone(ctx context.Context, userID, itemID string, done bool) error
+	SetPinned(ctx context.Context, userID, noteID string, pinned bool) error
+	FindFeed(ctx context.Context, q note.FeedQuery) ([]*note.Note, error)
 	SearchByUser(ctx context.Context, userID, query string) ([]*note.Note, error)
 	FindAgenda(ctx context.Context, userID string, from, to time.Time) ([]*note.Note, error)
 	FindItemsByNoteID(ctx context.Context, noteID string) ([]*note.NoteItem, error)
@@ -123,6 +126,7 @@ func (a *Assistant) Handle(ctx context.Context, req Request) (*Result, error) {
 	action.CreatedNoteIDs = exec.createdNoteIDs
 	action.AddedItemIDs = exec.addedItemIDs
 	action.ItemChanges = exec.itemChanges
+	action.PinChanges = exec.pinChanges
 	action.CalendarEventIDs = exec.calendarEventIDs
 	action.CalendarMoves = exec.calendarMoves
 	action.CancelledEvents = exec.cancelledEvents
@@ -157,6 +161,10 @@ func (a *Assistant) Handle(ctx context.Context, req Request) (*Result, error) {
 }
 
 func (a *Assistant) run(ctx context.Context, req Request, exec *executor, action *Action, now time.Time) (string, error) {
+	if isPinnedQuestion(req.Text) {
+		return a.answerPinned(ctx, exec, action)
+	}
+
 	listsStart := time.Now()
 	openLists, err := a.store.ListOpenChecklistTitles(ctx, req.UserID, openListsInContext)
 	action.timing.lists = time.Since(listsStart)
@@ -222,6 +230,19 @@ func (a *Assistant) run(ctx context.Context, req Request, exec *executor, action
 		}
 	}
 	return fallbackReply, fmt.Errorf("no final reply after %d rounds", maxRounds)
+}
+
+// answerPinned ตอบ "ปักอะไรไว้บ้าง" จาก DB ตรงๆ (ดู isPinnedQuestion) — บันทึกเป็น tool call ใน ai_actions เหมือนปกติ
+func (a *Assistant) answerPinned(ctx context.Context, exec *executor, action *Action) (string, error) {
+	toolStart := time.Now()
+	run := a.runTool(ctx, exec, ToolCall{ID: "direct", Name: "list_pinned", Input: json.RawMessage(`{"kind":"all"}`)})
+	action.timing.tools += time.Since(toolStart)
+	action.ToolCalls = append(action.ToolCalls, run)
+	if run.IsError {
+		return fallbackReply, errors.New("list pinned notes: " + run.Error)
+	}
+	views, _ := run.Result.(map[string]any)["notes"].([]noteView)
+	return pinnedReply(views), nil
 }
 
 func (a *Assistant) runTool(ctx context.Context, exec *executor, call ToolCall) toolRun {
@@ -315,6 +336,9 @@ func undoReplyText(r *UndoResult) string {
 	}
 	if r.RestoredItems > 0 {
 		parts = append(parts, fmt.Sprintf("คืนสถานะติ๊ก %d รายการ", r.RestoredItems))
+	}
+	if r.RestoredPins > 0 {
+		parts = append(parts, fmt.Sprintf("คืนสถานะปักหมุด %d รายการ", r.RestoredPins))
 	}
 	if r.DeletedEvents > 0 {
 		parts = append(parts, fmt.Sprintf("ลบนัดใน Google Calendar %d รายการ", r.DeletedEvents))

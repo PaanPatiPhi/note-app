@@ -124,6 +124,7 @@ func (h *APIHandler) undo(c *gin.Context) {
 		"deleted_notes":     res.DeletedNotes,
 		"removed_items":     res.RemovedItems,
 		"restored_items":    res.RestoredItems,
+		"restored_pins":     res.RestoredPins,
 		"deleted_events":    res.DeletedEvents,
 		"moved_back_events": res.MovedBack,
 		"recreated_events":  res.RecreatedEvents,

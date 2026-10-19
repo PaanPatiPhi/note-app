@@ -38,7 +38,12 @@ func toolSpecs() []ToolSpec {
 	strArray := func(desc string) map[string]any {
 		return map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": desc}
 	}
+	// pin ใส่ได้ตอนสร้าง: โมเดลเล็กสร้างแล้วเรียก pin_notes ต่อไม่ค่อยครบ จึงให้ปักในการเรียกเดียวกัน
+	pin := map[string]any{"type": "boolean", "description": "true only when the user asks to pin it to the widget (ปักไว้/ปักหมุด/เอาขึ้น widget)."}
 	tool := func(name, desc string, props map[string]any, required ...string) ToolSpec {
+		if required == nil {
+			required = []string{}
+		}
 		return ToolSpec{Name: name, Description: desc, Properties: props, Required: required}
 	}
 
@@ -48,6 +53,7 @@ func toolSpecs() []ToolSpec {
 			map[string]any{
 				"content":  str("The note text, without command words like 'จดว่า'."),
 				"due_date": str("Optional due date as YYYY-MM-DD (Asia/Bangkok) when the user mentions a deadline but no reminder time."),
+				"pin":      pin,
 			},
 			"content"),
 		tool("add_to_list",
@@ -55,6 +61,7 @@ func toolSpecs() []ToolSpec {
 			map[string]any{
 				"list_name": str("List name. Reuse an exact name from the open lists in <context> when the meaning matches."),
 				"items":     strArray("Items to add, one per element, without bullets or numbering."),
+				"pin":       pin,
 			},
 			"list_name", "items"),
 		tool("create_reminder",
@@ -62,6 +69,7 @@ func toolSpecs() []ToolSpec {
 			map[string]any{
 				"text":      str("What to remind the user about."),
 				"remind_at": str("When to remind, RFC3339 with +07:00 offset, e.g. 2026-10-16T09:00:00+07:00."),
+				"pin":       pin,
 			},
 			"text", "remind_at"),
 		tool("complete_items",
@@ -71,6 +79,24 @@ func toolSpecs() []ToolSpec {
 				"done":    map[string]any{"type": "boolean", "description": "true = mark done, false = mark not done."},
 			},
 			"queries", "done"),
+		tool("pin_notes",
+			"Pin notes or lists to the user's iPhone home-screen widget (pinned=true), or unpin them (pinned=false). "+
+				"Matches notes by their title/text. Returns ambiguous candidates when unsure.",
+			map[string]any{
+				"queries": strArray("Titles or text of the notes/lists to pin, e.g. [\"ซื้อของ\", \"เลขห้องประชุม\"]."),
+				"pinned":  map[string]any{"type": "boolean", "description": "true = pin to the widget, false = unpin."},
+			},
+			"queries", "pinned"),
+		tool("list_pinned",
+			"List the notes and lists currently pinned to the widget. Read-only.",
+			map[string]any{
+				// โมเดลเล็กเรียก tool ที่ไม่มี parameter เลยได้ไม่ค่อยดี จึงมีตัวกรองชนิดให้เลือก
+				"kind": map[string]any{
+					"type": "string", "enum": []string{"all", "checklist", "note", "reminder"},
+					"description": "Which pinned items to list; use \"all\" unless the user asks for one kind.",
+				},
+			},
+			"kind"),
 		tool("search_notes",
 			"Search the user's notes and lists by keyword. Read-only.",
 			map[string]any{
@@ -104,6 +130,14 @@ type itemChange struct {
 	Done         bool   `json:"done"`
 }
 
+// pinChange บันทึกสถานะปักหมุดเดิมของโน้ต เพื่อให้ undo ย้อนกลับได้ (คืนเวลาที่ปักเดิมด้วย)
+type pinChange struct {
+	NoteID           string     `json:"note_id"`
+	Content          string     `json:"content"`
+	PreviousPinnedAt *time.Time `json:"previous_pinned_at"`
+	Pinned           bool       `json:"pinned"`
+}
+
 // executor รัน tool ของ user หนึ่งคน และสะสมสิ่งที่ถูกเขียนลง DB ไว้ทำ undo
 type executor struct {
 	store  NoteStore
@@ -122,6 +156,7 @@ type executor struct {
 	createdNoteIDs []string
 	addedItemIDs   []string
 	itemChanges    []itemChange
+	pinChanges     []pinChange
 	// event ใน Google Calendar ที่สร้างในข้อความนี้ (ลบตอนกดยกเลิก)
 	calendarEventIDs []string
 	// นัดที่ถูกเลื่อนในข้อความนี้ (ย้ายกลับตอนกดยกเลิก)
@@ -131,7 +166,7 @@ type executor struct {
 }
 
 func (e *executor) wrote() bool {
-	return len(e.createdNoteIDs) > 0 || len(e.addedItemIDs) > 0 || len(e.itemChanges) > 0 || len(e.calendarEventIDs) > 0 || len(e.calendarMoves) > 0 || len(e.cancelledEvents) > 0
+	return len(e.createdNoteIDs) > 0 || len(e.addedItemIDs) > 0 || len(e.itemChanges) > 0 || len(e.pinChanges) > 0 || len(e.calendarEventIDs) > 0 || len(e.calendarMoves) > 0 || len(e.cancelledEvents) > 0
 }
 
 // run เรียก tool ตามชื่อ; error ชนิด errToolInput คือ input ผิด ส่วน error อื่นคือระบบผิดพลาด
@@ -141,29 +176,32 @@ func (e *executor) run(ctx context.Context, name string, input json.RawMessage) 
 		var in struct {
 			Content string `json:"content"`
 			DueDate string `json:"due_date"`
+			Pin     bool   `json:"pin"`
 		}
 		if err := json.Unmarshal(input, &in); err != nil {
 			return nil, badInput("invalid input: %v", err)
 		}
-		return e.createNote(ctx, in.Content, in.DueDate)
+		return e.withPin(ctx, in.Pin)(e.createNote(ctx, in.Content, in.DueDate))
 	case "add_to_list":
 		var in struct {
 			ListName string   `json:"list_name"`
 			Items    []string `json:"items"`
+			Pin      bool     `json:"pin"`
 		}
 		if err := json.Unmarshal(input, &in); err != nil {
 			return nil, badInput("invalid input: %v", err)
 		}
-		return e.addToList(ctx, in.ListName, in.Items)
+		return e.withPin(ctx, in.Pin)(e.addToList(ctx, in.ListName, in.Items))
 	case "create_reminder":
 		var in struct {
 			Text     string `json:"text"`
 			RemindAt string `json:"remind_at"`
+			Pin      bool   `json:"pin"`
 		}
 		if err := json.Unmarshal(input, &in); err != nil {
 			return nil, badInput("invalid input: %v", err)
 		}
-		return e.createReminder(ctx, in.Text, in.RemindAt)
+		return e.withPin(ctx, in.Pin)(e.createReminder(ctx, in.Text, in.RemindAt))
 	case "move_event":
 		return e.moveEvent(ctx, input)
 	case "cancel_event":
@@ -177,6 +215,23 @@ func (e *executor) run(ctx context.Context, name string, input json.RawMessage) 
 			return nil, badInput("invalid input: %v", err)
 		}
 		return e.completeItems(ctx, in.Queries, in.Done)
+	case "pin_notes":
+		var in struct {
+			Queries []string `json:"queries"`
+			Pinned  bool     `json:"pinned"`
+		}
+		if err := json.Unmarshal(input, &in); err != nil {
+			return nil, badInput("invalid input: %v", err)
+		}
+		return e.pinNotes(ctx, in.Queries, in.Pinned)
+	case "list_pinned":
+		var in struct {
+			Kind string `json:"kind"`
+		}
+		if err := json.Unmarshal(input, &in); err != nil {
+			return nil, badInput("invalid input: %v", err)
+		}
+		return e.listPinned(ctx, in.Kind)
 	case "search_notes":
 		var in struct {
 			Query string `json:"query"`
@@ -266,7 +321,7 @@ func (e *executor) addToList(ctx context.Context, listName string, items []strin
 			return nil, err
 		}
 		e.createdNoteIDs = append(e.createdNoteIDs, n.ID)
-		return map[string]any{"list": listName, "created_new_list": true, "added": clean}, nil
+		return map[string]any{"note_id": n.ID, "list": listName, "created_new_list": true, "added": clean}, nil
 	}
 
 	added, err := e.store.AppendItems(ctx, e.userID, existing.ID, clean)
@@ -276,7 +331,8 @@ func (e *executor) addToList(ctx context.Context, listName string, items []strin
 	for _, it := range added {
 		e.addedItemIDs = append(e.addedItemIDs, it.ID)
 	}
-	return map[string]any{"list": listName, "created_new_list": false, "added": clean}, nil
+	return map[string]any{"note_id": existing.ID, "list": listName, "created_new_list": false, "added": clean,
+		"previous_pinned_at": existing.PinnedAt}, nil
 }
 
 func (e *executor) createReminder(ctx context.Context, text, remindAt string) (any, error) {
@@ -398,13 +454,14 @@ type noteView struct {
 	Created  string   `json:"created"`
 	RemindAt string   `json:"remind_at,omitempty"`
 	DueDate  string   `json:"due_date,omitempty"`
+	Pinned   bool     `json:"pinned,omitempty"`
 	Items    []string `json:"items,omitempty"`
 }
 
 func (e *executor) viewNotes(ctx context.Context, notes []*note.Note) ([]noteView, error) {
 	views := make([]noteView, 0, len(notes))
 	for _, n := range notes {
-		v := noteView{Type: string(n.Type), Created: n.CreatedAt.In(bangkok).Format("2006-01-02 15:04")}
+		v := noteView{Type: string(n.Type), Created: n.CreatedAt.In(bangkok).Format("2006-01-02 15:04"), Pinned: n.PinnedAt != nil}
 		if n.Content != nil {
 			v.Content = *n.Content
 		}
@@ -470,6 +527,163 @@ func (e *executor) listAgenda(ctx context.Context, fromStr, toStr string) (any, 
 	}
 	views = append(views, e.calendarAgenda(ctx, from, to.AddDate(0, 0, 1))...)
 	return map[string]any{"from": fromStr, "to": toStr, "count": len(views), "items": views}, nil
+}
+
+// withPin ปักโน้ตที่ tool เพิ่งสร้าง/เพิ่มของเข้าไป เมื่อผู้ใช้ขอให้ปัก (ช่อง pin)
+// ใช้ห่อผลของ tool: e.withPin(ctx, pin)(e.createNote(...))
+func (e *executor) withPin(ctx context.Context, pin bool) func(any, error) (any, error) {
+	return func(result any, err error) (any, error) {
+		if err != nil || !pin {
+			return result, err
+		}
+		m, ok := result.(map[string]any)
+		id, _ := m["note_id"].(string)
+		if !ok || id == "" {
+			return result, nil
+		}
+		prev, _ := m["previous_pinned_at"].(*time.Time)
+		delete(m, "previous_pinned_at")
+		if prev == nil {
+			if err := e.store.SetPinned(ctx, e.userID, id, true); err != nil {
+				return nil, err
+			}
+			content, _ := m["saved"].(string)
+			if content == "" {
+				content, _ = m["text"].(string)
+			}
+			if content == "" {
+				content, _ = m["list"].(string)
+			}
+			e.pinChanges = append(e.pinChanges, pinChange{NoteID: id, Content: content, Pinned: true})
+		}
+		m["pinned"] = true
+		return m, nil
+	}
+}
+
+type pinCandidate struct {
+	Content string `json:"content"`
+	Type    string `json:"type"`
+	Date    string `json:"date"`
+	Pinned  bool   `json:"pinned"`
+}
+
+func (e *executor) pinNotes(ctx context.Context, queries []string, pinned bool) (any, error) {
+	var (
+		changed   []string
+		ambiguous = map[string][]pinCandidate{}
+		notFound  []string
+	)
+	for _, q := range queries {
+		q = strings.TrimSpace(q)
+		if q == "" {
+			continue
+		}
+		matches, err := e.store.SearchByUser(ctx, e.userID, q)
+		if err != nil {
+			return nil, err
+		}
+		best, ok := pickPinTarget(matches, q, pinned)
+		if !ok {
+			if len(matches) == 0 {
+				notFound = append(notFound, q)
+				continue
+			}
+			for i, m := range matches {
+				if i == fuzzyMaxChoices {
+					break
+				}
+				ambiguous[q] = append(ambiguous[q], pinCandidate{
+					Content: noteContent(m), Type: string(m.Type),
+					Date: m.CreatedAt.In(bangkok).Format("2006-01-02"), Pinned: m.PinnedAt != nil,
+				})
+			}
+			continue
+		}
+		if (best.PinnedAt != nil) == pinned {
+			changed = append(changed, noteContent(best))
+			continue // สถานะตรงอยู่แล้ว ไม่ต้องเขียน
+		}
+		if err := e.store.SetPinned(ctx, e.userID, best.ID, pinned); err != nil {
+			return nil, err
+		}
+		e.pinChanges = append(e.pinChanges, pinChange{
+			NoteID: best.ID, Content: noteContent(best), PreviousPinnedAt: best.PinnedAt, Pinned: pinned,
+		})
+		changed = append(changed, noteContent(best))
+	}
+
+	result := map[string]any{"pinned": pinned, "updated": changed}
+	if len(ambiguous) > 0 {
+		result["ambiguous"] = ambiguous
+	}
+	if len(notFound) > 0 {
+		result["not_found"] = notFound
+	}
+	return result, nil
+}
+
+// pickPinTarget เลือกโน้ตที่แน่ใจจากผลค้นหา (เรียงใหม่ → เก่า):
+// เจอตัวเดียว, ชื่อตรงเป๊ะตัวเดียว, หรือมีตัวเดียวที่ยังไม่อยู่ในสถานะที่ต้องการ
+// (ตอนปักจะข้ามโน้ตที่ทำเสร็จแล้ว)
+func pickPinTarget(matches []*note.Note, query string, pinned bool) (*note.Note, bool) {
+	if len(matches) == 0 {
+		return nil, false
+	}
+	if len(matches) == 1 {
+		return matches[0], true
+	}
+	var exact []*note.Note
+	for _, m := range matches {
+		if strings.EqualFold(strings.TrimSpace(noteContent(m)), query) {
+			exact = append(exact, m)
+		}
+	}
+	if len(exact) == 1 {
+		return exact[0], true
+	}
+	pool := matches
+	if len(exact) > 1 {
+		pool = exact
+	}
+	var pending []*note.Note
+	for _, m := range pool {
+		if (m.PinnedAt != nil) != pinned && !(pinned && m.IsDone) {
+			pending = append(pending, m)
+		}
+	}
+	if len(pending) == 1 {
+		return pending[0], true
+	}
+	return nil, false
+}
+
+func noteContent(n *note.Note) string {
+	if n.Content == nil {
+		return ""
+	}
+	return *n.Content
+}
+
+func (e *executor) listPinned(ctx context.Context, kind string) (any, error) {
+	q := note.FeedQuery{UserID: e.userID, Desc: true, Limit: 50, PinnedOnly: true}
+	switch kind {
+	case "", "all":
+	case "checklist", "note", "reminder":
+		t := note.NoteType(kind)
+		q.TypeFilter = &t
+	default:
+		return nil, badInput("kind must be all, checklist, note or reminder")
+	}
+	notes, err := e.store.FindFeed(ctx, q)
+	if err != nil {
+		return nil, err
+	}
+	views, err := e.viewNotes(ctx, notes)
+	if err != nil {
+		return nil, err
+	}
+	return map[string]any{"count": len(views), "notes": views}, nil
 }
 
 // toolResultText แปลงผลของ tool เป็นข้อความที่ส่งกลับให้โมเดล

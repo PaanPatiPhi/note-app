@@ -37,6 +37,7 @@ type createRequest struct {
 type updateRequest struct {
 	Content *string `json:"content,omitempty"`
 	IsDone  *bool   `json:"is_done,omitempty"`
+	Pinned  *bool   `json:"pinned,omitempty"`
 }
 
 type toggleItemRequest struct {
@@ -52,6 +53,7 @@ type noteDTO struct {
 	DueDate   *time.Time `json:"due_date,omitempty"`
 	RemindAt  *time.Time `json:"remind_at,omitempty"`
 	Source    string     `json:"source"`
+	Pinned    bool       `json:"pinned"`
 	CreatedAt time.Time  `json:"created_at"`
 	Items     []itemDTO  `json:"items,omitempty"`
 }
@@ -66,6 +68,7 @@ func toNoteDTO(n *Note, items []*NoteItem) noteDTO {
 	dto := noteDTO{
 		ID: n.ID, Type: string(n.Type), IsDone: n.IsDone, CreatedAt: n.CreatedAt,
 		DueDate: n.DueDate, RemindAt: n.RemindAt, Source: string(n.Source),
+		Pinned: n.PinnedAt != nil,
 	}
 	if n.Content != nil {
 		dto.Content = *n.Content
@@ -147,7 +150,7 @@ func (h *APIHandler) create(c *gin.Context) {
 	c.JSON(http.StatusCreated, gin.H{"note": toNoteDTO(n, items)})
 }
 
-// feed: GET /api/notes?type=&q=&sort=&after=&limit=
+// feed: GET /api/notes?type=&q=&sort=&after=&limit=&pinned=true
 // รวม list ปกติ + search ไว้ endpoint เดียว (ใส่ q มา = ค้นหา, ไม่ใส่ = list ปกติ)
 // pagination แบบ cursor: ส่ง next_cursor ที่ได้ไปเป็น "after" ในการเรียกครั้งถัดไป
 // next_cursor เป็น null แปลว่าหมดแล้ว ไม่ต้องโหลดต่อ
@@ -195,6 +198,7 @@ func (h *APIHandler) feed(c *gin.Context) {
 		After:      after,
 		Desc:       desc,
 		Limit:      limit,
+		PinnedOnly: c.Query("pinned") == "true",
 	})
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "feed failed"})
@@ -236,7 +240,7 @@ func (h *APIHandler) update(c *gin.Context) {
 		return
 	}
 
-	if req.Content == nil && req.IsDone == nil {
+	if req.Content == nil && req.IsDone == nil && req.Pinned == nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "nothing to update"})
 		return
 	}
@@ -255,6 +259,14 @@ func (h *APIHandler) update(c *gin.Context) {
 
 	if req.IsDone != nil {
 		err := h.service.SetNoteDoneFromAPI(c.Request.Context(), userID, lineUserID, displayName, noteID, *req.IsDone)
+		if err != nil {
+			c.JSON(http.StatusNotFound, gin.H{"error": "note not found"})
+			return
+		}
+	}
+
+	if req.Pinned != nil {
+		err := h.service.SetPinnedFromAPI(c.Request.Context(), userID, lineUserID, displayName, noteID, *req.Pinned)
 		if err != nil {
 			c.JSON(http.StatusNotFound, gin.H{"error": "note not found"})
 			return

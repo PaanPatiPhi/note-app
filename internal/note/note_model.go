@@ -38,6 +38,7 @@ type Note struct {
 	RemindAt   *time.Time `db:"remind_at"`   // เวลาที่ต้องส่งเตือน (เฉพาะ type reminder)
 	RemindedAt *time.Time `db:"reminded_at"` // เวลาที่ส่งเตือนไปแล้ว; nil = ยังไม่ส่ง
 	Source     NoteSource `db:"source"`      // ว่างตอน insert = ใช้ NoteSourceLine
+	PinnedAt   *time.Time `db:"pinned_at"`   // เวลาที่ปักหมุด; nil = ไม่ได้ปัก
 	CreatedAt  time.Time  `db:"created_at"`
 	UpdatedAt  time.Time  `db:"updated_at"`
 }

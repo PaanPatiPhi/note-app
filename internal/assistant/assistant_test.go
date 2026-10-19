@@ -61,11 +61,12 @@ type fakeStore struct {
 	matches  map[string][]*note.ItemMatch
 	setDone  map[string]bool
 	appended []string
+	pinned   map[string]bool // note id -> สถานะที่ SetPinned ตั้ง
 	nextID   int
 }
 
 func newFakeStore() *fakeStore {
-	return &fakeStore{items: map[string][]*note.NoteItem{}, matches: map[string][]*note.ItemMatch{}, setDone: map[string]bool{}}
+	return &fakeStore{items: map[string][]*note.NoteItem{}, matches: map[string][]*note.ItemMatch{}, setDone: map[string]bool{}, pinned: map[string]bool{}}
 }
 
 func (s *fakeStore) id(prefix string) string {
@@ -128,8 +129,30 @@ func (s *fakeStore) SetItemDone(_ context.Context, _ string, itemID string, done
 	return nil
 }
 
-func (s *fakeStore) SearchByUser(context.Context, string, string) ([]*note.Note, error) {
-	return nil, nil
+// SearchByUser ค้นแบบ substring เรียงใหม่ → เก่า เหมือน note.Repository
+func (s *fakeStore) SearchByUser(_ context.Context, _ string, query string) ([]*note.Note, error) {
+	var out []*note.Note
+	for i := len(s.notes) - 1; i >= 0; i-- {
+		if n := s.notes[i]; n.Content != nil && strings.Contains(strings.ToLower(*n.Content), strings.ToLower(query)) {
+			out = append(out, n)
+		}
+	}
+	return out, nil
+}
+
+func (s *fakeStore) SetPinned(_ context.Context, _ string, noteID string, pinned bool) error {
+	s.pinned[noteID] = pinned
+	return nil
+}
+
+func (s *fakeStore) FindFeed(_ context.Context, q note.FeedQuery) ([]*note.Note, error) {
+	var out []*note.Note
+	for _, n := range s.notes {
+		if !q.PinnedOnly || n.PinnedAt != nil {
+			out = append(out, n)
+		}
+	}
+	return out, nil
 }
 
 func (s *fakeStore) FindAgenda(context.Context, string, time.Time, time.Time) ([]*note.Note, error) {
@@ -383,7 +406,7 @@ func TestClaudeRequestHasStrictTools(t *testing.T) {
 	if err := json.Unmarshal([]byte(llm.requests[0]), &req); err != nil {
 		t.Fatal(err)
 	}
-	if len(req.Tools) != 6 || req.Model != DefaultClaudeModel || req.OutputConfig["effort"] != "low" {
+	if len(req.Tools) != 8 || req.Model != DefaultClaudeModel || req.OutputConfig["effort"] != "low" {
 		t.Fatalf("request = %d tools, model %q, output_config %v", len(req.Tools), req.Model, req.OutputConfig)
 	}
 	for _, tool := range req.Tools {
@@ -595,6 +618,7 @@ func TestUndoReplyText(t *testing.T) {
 		{UndoResult{AlreadyUndone: true}, "รายการนี้ยกเลิกไปแล้วครับ"},
 		{UndoResult{Expired: true}, "ยกเลิกได้ภายใน 24 ชั่วโมงครับ รายการนี้เก่าเกินไปแล้ว"},
 		{UndoResult{DeletedNotes: 1, RemovedItems: 2}, "↩️ ยกเลิกแล้วครับ: ลบที่จดไว้ 1 รายการ, เอาออกจากลิสต์ 2 รายการ"},
+		{UndoResult{RestoredPins: 1}, "↩️ ยกเลิกแล้วครับ: คืนสถานะปักหมุด 1 รายการ"},
 		{UndoResult{}, "↩️ ยกเลิกแล้วครับ (ข้อมูลถูกลบหรือแก้ไปก่อนหน้านี้แล้ว)"},
 	} {
 		if got := undoReplyText(&tc.res); got != tc.want {
@@ -605,4 +629,127 @@ func TestUndoReplyText(t *testing.T) {
 
 func (f *fakeActions) History(context.Context, string, int, *time.Time) ([]HistoryItem, error) {
 	return nil, nil
+}
+
+func TestPinNotesPicksExactTitleAndRecordsPreviousState(t *testing.T) {
+	store := newFakeStore()
+	str := func(s string) *string { return &s }
+	pinnedAt := testNow.Add(-time.Hour)
+	store.notes = []*note.Note{
+		{ID: "list-shop", Content: str("ซื้อของ"), Type: note.NoteTypeChecklist},
+		{ID: "note-gift", Content: str("ซื้อของขวัญให้แม่"), Type: note.NoteTypeNote},
+		{ID: "meet-team", Content: str("ประชุมทีม"), Type: note.NoteTypeNote},
+		{ID: "meet-client", Content: str("ประชุมลูกค้า"), Type: note.NoteTypeNote},
+		{ID: "room", Content: str("เลขห้อง 504"), Type: note.NoteTypeNote, PinnedAt: &pinnedAt},
+	}
+	llm := &fakeLLM{responses: []string{
+		toolUseMsg("t1", "pin_notes", map[string]any{"queries": []string{"ซื้อของ", "ประชุม", "ตั๋วหนัง"}, "pinned": true}),
+		toolUseMsg("t2", "pin_notes", map[string]any{"queries": []string{"เลขห้อง"}, "pinned": false}),
+		textMsg("📌 ปักลิสต์ซื้อของแล้ว ส่วนประชุม หมายถึงอันไหนครับ"),
+	}}
+	a, actions := newTestAssistant(llm, store)
+
+	res := handle(t, a, "ปักลิสต์ซื้อของกับประชุมไว้ เอาเลขห้องออก")
+
+	if len(store.pinned) != 2 || !store.pinned["list-shop"] || store.pinned["room"] {
+		t.Fatalf("SetPinned calls = %v, want list-shop=true and room=false only", store.pinned)
+	}
+	changes := actions.saved[0].PinChanges
+	if len(changes) != 2 || changes[0].PreviousPinnedAt != nil || !changes[0].Pinned ||
+		changes[1].PreviousPinnedAt == nil || !changes[1].PreviousPinnedAt.Equal(pinnedAt) || changes[1].Pinned {
+		t.Errorf("pin changes = %+v", changes)
+	}
+	for _, want := range []string{`ambiguous`, `ประชุมลูกค้า`, `not_found`, `ตั๋วหนัง`} {
+		if !strings.Contains(llm.requests[1], want) {
+			t.Errorf("tool_result should mention %q", want)
+		}
+	}
+	if !res.Wrote {
+		t.Error("pinning should count as a write so the web refreshes and undo is offered")
+	}
+}
+
+func TestPickPinTarget(t *testing.T) {
+	str := func(s string) *string { return &s }
+	at := testNow
+	n := func(id, content string, pinned, done bool) *note.Note {
+		x := &note.Note{ID: id, Content: str(content), IsDone: done}
+		if pinned {
+			x.PinnedAt = &at
+		}
+		return x
+	}
+	cases := []struct {
+		name    string
+		matches []*note.Note
+		query   string
+		pinned  bool
+		wantID  string
+	}{
+		{"none", nil, "x", true, ""},
+		{"single partial match", []*note.Note{n("a", "ซื้อของเข้าบ้าน", false, false)}, "ซื้อของ", true, "a"},
+		{"exact title wins", []*note.Note{n("a", "ซื้อของขวัญ", false, false), n("b", "ซื้อของ", false, false)}, "ซื้อของ", true, "b"},
+		{"two partial matches", []*note.Note{n("a", "ประชุมทีม", false, false), n("b", "ประชุมลูกค้า", false, false)}, "ประชุม", true, ""},
+		{"unpin the only pinned one", []*note.Note{n("a", "ประชุมทีม", false, false), n("b", "ประชุมลูกค้า", true, false)}, "ประชุม", false, "b"},
+		{"skip done when pinning", []*note.Note{n("a", "ซื้อของ 1", false, true), n("b", "ซื้อของ 2", false, false)}, "ซื้อของ", true, "b"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := pickPinTarget(tc.matches, tc.query, tc.pinned)
+			gotID := ""
+			if ok {
+				gotID = got.ID
+			}
+			if gotID != tc.wantID {
+				t.Errorf("pickPinTarget = %q, want %q", gotID, tc.wantID)
+			}
+		})
+	}
+}
+
+func TestListPinnedShowsOnlyPinned(t *testing.T) {
+	store := newFakeStore()
+	str := func(s string) *string { return &s }
+	at := testNow
+	store.notes = []*note.Note{
+		{ID: "a", Content: str("ปักไว้"), Type: note.NoteTypeNote, PinnedAt: &at},
+		{ID: "b", Content: str("ไม่ได้ปัก"), Type: note.NoteTypeNote},
+	}
+	llm := &fakeLLM{responses: []string{
+		toolUseMsg("t1", "list_pinned", map[string]any{"kind": "all"}),
+		textMsg("📌 ตอนนี้ปักไว้ 1 รายการครับ"),
+	}}
+	a, _ := newTestAssistant(llm, store)
+	handle(t, a, "ขอดูของที่ปักไว้หน่อย") // ไม่ใช่รูปคำถามที่ตอบตรงจาก DB จึงผ่านโมเดล
+	if !strings.Contains(llm.requests[1], `ปักไว้`) || strings.Contains(llm.requests[1], `ไม่ได้ปัก`) {
+		t.Errorf("list_pinned result = %s", llm.requests[1])
+	}
+}
+
+func TestCreateWithPinPinsNewNote(t *testing.T) {
+	store := newFakeStore()
+	llm := &fakeLLM{responses: []string{
+		toolUseMsg("t1", "create_reminder", map[string]any{"text": "จ่ายค่าเน็ต", "remind_at": "2026-10-16T10:00:00+07:00", "pin": true}),
+		toolUseMsg("t2", "add_to_list", map[string]any{"list_name": "ซื้อของ", "items": []string{"ผ้าปู"}, "pin": true}),
+		toolUseMsg("t3", "create_note", map[string]any{"content": "ไม่ต้องปัก"}),
+		textMsg("⏰ ตั้งเตือนแล้วปักไว้ครับ"),
+	}}
+	a, actions := newTestAssistant(llm, store)
+
+	handle(t, a, "เตือนจ่ายค่าเน็ตพรุ่งนี้ 10 โมง ปักไว้ด้วย ซื้อผ้าปูด้วย ปักไว้")
+
+	if len(store.pinned) != 2 {
+		t.Fatalf("SetPinned calls = %v, want the reminder and the list", store.pinned)
+	}
+	for id := range store.pinned {
+		if id == store.notes[2].ID {
+			t.Error("note without pin=true must not be pinned")
+		}
+	}
+	if changes := actions.saved[0].PinChanges; len(changes) != 2 || changes[0].Content != "จ่ายค่าเน็ต" || changes[1].Content != "ซื้อของ" {
+		t.Errorf("pin changes = %+v", changes)
+	}
+	if !strings.Contains(llm.requests[1], `\"pinned\":true`) {
+		t.Error("tool_result should confirm pinned")
+	}
 }

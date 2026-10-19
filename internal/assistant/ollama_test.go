@@ -61,7 +61,7 @@ func TestOllamaToolLoop(t *testing.T) {
 	}
 
 	first := (*reqs)[0]
-	if first.Model != DefaultOllamaModel || first.Stream || first.Think || len(first.Tools) != 6 {
+	if first.Model != DefaultOllamaModel || first.Stream || first.Think || len(first.Tools) != 8 {
 		t.Errorf("first request = model %q stream %v think %v tools %d", first.Model, first.Stream, first.Think, len(first.Tools))
 	}
 	if first.Options["num_ctx"] != float64(ollamaNumCtx) {

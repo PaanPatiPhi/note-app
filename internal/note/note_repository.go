@@ -169,6 +169,7 @@ type FeedQuery struct {
 	After      *time.Time // cursor: created_at ของรายการสุดท้ายที่เห็นแล้ว, nil = หน้าแรก
 	Desc       bool
 	Limit      int
+	PinnedOnly bool // true = เฉพาะโน้ตที่ปักหมุด (ใช้กับ widget)
 }
 
 // FindFeed ดึงโน้ตแบบรวม type filter + search + cursor pagination ในคำสั่งเดียว
@@ -197,6 +198,9 @@ func (r *Repository) FindFeed(ctx context.Context, q FeedQuery) ([]*Note, error)
 	if q.Search != "" {
 		args = append(args, q.Search)
 		where += fmt.Sprintf(" AND content ILIKE '%%' || $%d || '%%'", len(args))
+	}
+	if q.PinnedOnly {
+		where += " AND pinned_at IS NOT NULL"
 	}
 	if q.After != nil {
 		args = append(args, *q.After)
@@ -315,6 +319,20 @@ func (r *Repository) SetNoteDone(ctx context.Context, userID, noteID string, don
 	return nil
 }
 
+// SetPinned ปัก/ถอนหมุดโน้ต (ปักซ้ำไม่เลื่อนเวลาที่ปักไว้เดิม)
+func (r *Repository) SetPinned(ctx context.Context, userID, noteID string, pinned bool) error {
+	q := `UPDATE notes SET pinned_at = CASE WHEN $1::boolean THEN coalesce(pinned_at, now()) END
+		WHERE id = $2 AND user_id = $3`
+	tag, err := r.pool.Exec(ctx, q, pinned, noteID, userID)
+	if err != nil {
+		return fmt.Errorf("set pinned: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("note not found or not owned by user")
+	}
+	return nil
+}
+
 func (r *Repository) SetItemDone(ctx context.Context, userID, itemID string, done bool) error {
 	q := `
 		UPDATE note_items SET is_done = $1
@@ -348,7 +366,7 @@ func (r *Repository) FindItemByPosition(ctx context.Context, noteID string, posi
 
 // noteColumns คือคอลัมน์ของ notes ที่ SELECT ทุกครั้ง ต้องเรียงตรงกับ scanNote
 const noteColumns = `id, user_id, content, type, is_done, due_date, image_url,
-		remind_at, reminded_at, source, created_at, updated_at`
+		remind_at, reminded_at, source, pinned_at, created_at, updated_at`
 
 // scanNote scan หนึ่งแถวที่ SELECT ด้วย noteColumns
 func scanNote(row interface{ Scan(...any) error }) (*Note, error) {
@@ -356,7 +374,7 @@ func scanNote(row interface{ Scan(...any) error }) (*Note, error) {
 	err := row.Scan(
 		&n.ID, &n.UserID, &n.Content, &n.Type, &n.IsDone,
 		&n.DueDate, &n.ImageURL, &n.RemindAt, &n.RemindedAt, &n.Source,
-		&n.CreatedAt, &n.UpdatedAt,
+		&n.PinnedAt, &n.CreatedAt, &n.UpdatedAt,
 	)
 	if err != nil {
 		return nil, err

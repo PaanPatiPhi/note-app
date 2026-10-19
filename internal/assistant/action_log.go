@@ -27,6 +27,8 @@ type Action struct {
 	CreatedNoteIDs []string
 	AddedItemIDs   []string
 	ItemChanges    []itemChange
+	// โน้ตที่ถูกปัก/ถอดหมุด (คืนสถานะเดิมตอนยกเลิก)
+	PinChanges []pinChange
 	// event ใน Google Calendar ที่สร้าง (ลบตอนยกเลิก)
 	CalendarEventIDs []string
 	// นัดที่ถูกเลื่อน (ย้ายกลับเวลาเดิมตอนยกเลิก)
@@ -52,6 +54,7 @@ type actionDetails struct {
 	Calls            []toolRun        `json:"calls"`
 	AddedItemIDs     []string         `json:"added_item_ids,omitempty"`
 	ItemChanges      []itemChange     `json:"item_changes,omitempty"`
+	PinChanges       []pinChange      `json:"pin_changes,omitempty"`
 	CalendarEventIDs []string         `json:"calendar_event_ids,omitempty"`
 	CalendarMoves    []eventMove      `json:"calendar_moves,omitempty"`
 	CancelledEvents  []cancelledEvent `json:"cancelled_events,omitempty"`
@@ -68,7 +71,7 @@ func NewActionRepository(pool *pgxpool.Pool) *ActionRepository {
 
 func (r *ActionRepository) Insert(ctx context.Context, a *Action) (string, error) {
 	details, err := json.Marshal(actionDetails{
-		Calls: a.ToolCalls, AddedItemIDs: a.AddedItemIDs, ItemChanges: a.ItemChanges,
+		Calls: a.ToolCalls, AddedItemIDs: a.AddedItemIDs, ItemChanges: a.ItemChanges, PinChanges: a.PinChanges,
 		CalendarEventIDs: a.CalendarEventIDs, CalendarMoves: a.CalendarMoves,
 		CancelledEvents: a.CancelledEvents, Error: a.Error,
 	})
@@ -145,6 +148,7 @@ type UndoResult struct {
 	DeletedNotes  int64 // โน้ต/ลิสต์/เตือน ที่ AI สร้าง แล้วถูกลบ
 	RemovedItems  int64 // item ที่ AI เพิ่มเข้าลิสต์เดิม แล้วถูกเอาออก
 	RestoredItems int64 // item ที่ AI ติ๊ก แล้วถูกคืนสถานะเดิม
+	RestoredPins  int64 // โน้ตที่ AI ปัก/ถอดหมุด แล้วถูกคืนสถานะเดิม
 
 	// CalendarEventIDs คือ event ใน Google Calendar ที่ต้องลบ (Assistant.UndoAction ลบให้)
 	CalendarEventIDs []string
@@ -216,6 +220,22 @@ func (r *ActionRepository) Undo(ctx context.Context, userID, actionID string) (*
 		}
 		res.RestoredItems = tag.RowsAffected()
 	}
+	if len(details.PinChanges) > 0 {
+		ids := make([]string, len(details.PinChanges))
+		prev := make([]*time.Time, len(details.PinChanges))
+		for i, c := range details.PinChanges {
+			ids[i], prev[i] = c.NoteID, c.PreviousPinnedAt
+		}
+		tag, err := tx.Exec(ctx, `
+			UPDATE notes n SET pinned_at = c.prev
+			FROM unnest($1::uuid[], $2::timestamptz[]) AS c(id, prev)
+			WHERE n.id = c.id AND n.user_id = $3
+		`, ids, prev, userID)
+		if err != nil {
+			return nil, fmt.Errorf("restore pins: %w", err)
+		}
+		res.RestoredPins = tag.RowsAffected()
+	}
 	if len(details.AddedItemIDs) > 0 {
 		tag, err := tx.Exec(ctx, `
 			DELETE FROM note_items ni USING notes n
@@ -268,6 +288,7 @@ func (r *ActionRepository) History(ctx context.Context, userID string, limit int
 		       webhook_event_id IS NOT NULL,
 		       created_at, undone_at,
 		       cardinality(created_note_ids) > 0 OR cardinality(touched_item_ids) > 0
+		       OR jsonb_array_length(coalesce(tool_calls->'pin_changes', '[]'::jsonb)) > 0
 		       OR jsonb_array_length(coalesce(tool_calls->'calendar_event_ids', '[]'::jsonb)) > 0
 		       OR jsonb_array_length(coalesce(tool_calls->'calendar_moves', '[]'::jsonb)) > 0
 		       OR jsonb_array_length(coalesce(tool_calls->'cancelled_events', '[]'::jsonb)) > 0

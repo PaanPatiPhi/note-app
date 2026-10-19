@@ -441,6 +441,7 @@ type FeedParams struct {
 	After      *time.Time
 	Desc       bool
 	Limit      int
+	PinnedOnly bool
 }
 
 func (s *Service) ListFeedFromAPI(ctx context.Context, userID, lineUserID, displayName string, p FeedParams) ([]*Note, map[string][]*NoteItem, error) {
@@ -450,7 +451,7 @@ func (s *Service) ListFeedFromAPI(ctx context.Context, userID, lineUserID, displ
 	}
 	notes, err := s.noteRepo.FindFeed(ctx, FeedQuery{
 		UserID: uid, TypeFilter: p.TypeFilter, Search: p.Search,
-		After: p.After, Desc: p.Desc, Limit: p.Limit,
+		After: p.After, Desc: p.Desc, Limit: p.Limit, PinnedOnly: p.PinnedOnly,
 	})
 	if err != nil {
 		return nil, nil, fmt.Errorf("list feed: %w", err)
@@ -492,6 +493,14 @@ func (s *Service) SetNoteDoneFromAPI(ctx context.Context, userID, lineUserID, di
 		return fmt.Errorf("resolve user: %w", err)
 	}
 	return s.noteRepo.SetNoteDone(ctx, uid, noteID, done)
+}
+
+func (s *Service) SetPinnedFromAPI(ctx context.Context, userID, lineUserID, displayName, noteID string, pinned bool) error {
+	uid, err := s.resolveUserID(ctx, userID, lineUserID, displayName)
+	if err != nil {
+		return fmt.Errorf("resolve user: %w", err)
+	}
+	return s.noteRepo.SetPinned(ctx, uid, noteID, pinned)
 }
 
 func (s *Service) SetItemDoneFromAPI(ctx context.Context, userID, lineUserID, displayName, itemID string, done bool) error {

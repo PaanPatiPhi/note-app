@@ -251,3 +251,57 @@ func TestActionRepositoryHistory(t *testing.T) {
 		t.Fatalf("before newest = %+v, want only the older one", older)
 	}
 }
+
+func TestActionRepositoryUndoRestoresPins(t *testing.T) {
+	pool := dbPool(t)
+	ctx := context.Background()
+	notes := note.NewRepository(pool)
+	actions := NewActionRepository(pool)
+	userID := dbUser(t, pool)
+
+	save := func(text string) *note.Note {
+		n := &note.Note{UserID: userID, Content: &text, Type: note.NoteTypeNote, Source: note.NoteSourceWeb}
+		if err := notes.SaveNote(ctx, n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	// ก่อน AI: "เลขห้อง" ปักอยู่แล้ว, "ซื้อของ" ยังไม่ได้ปัก
+	room, shop := save("เลขห้อง 504"), save("ซื้อของ")
+	if err := notes.SetPinned(ctx, userID, room.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := notes.FindByUserAndID(ctx, userID, room.ID)
+
+	// AI ปัก "ซื้อของ" และถอดหมุด "เลขห้อง"
+	_ = notes.SetPinned(ctx, userID, shop.ID, true)
+	_ = notes.SetPinned(ctx, userID, room.ID, false)
+	actionID, err := actions.Insert(ctx, &Action{
+		UserID: userID, InputText: "ทดสอบ undo ปักหมุด", Model: "test",
+		PinChanges: []pinChange{
+			{NoteID: shop.ID, Content: "ซื้อของ", PreviousPinnedAt: nil, Pinned: true},
+			{NoteID: room.ID, Content: "เลขห้อง 504", PreviousPinnedAt: before.PinnedAt, Pinned: false},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	history, err := actions.History(ctx, userID, 10, nil)
+	if err != nil || len(history) != 1 || !history[0].Undoable {
+		t.Fatalf("history = %+v, %v; a pin-only action should be undoable", history, err)
+	}
+
+	res, err := actions.Undo(ctx, userID, actionID)
+	if err != nil || res.RestoredPins != 2 {
+		t.Fatalf("Undo = %+v, %v; want 2 restored pins", res, err)
+	}
+	gotShop, _ := notes.FindByUserAndID(ctx, userID, shop.ID)
+	gotRoom, _ := notes.FindByUserAndID(ctx, userID, room.ID)
+	if gotShop.PinnedAt != nil {
+		t.Error("ซื้อของ should be unpinned again")
+	}
+	if gotRoom.PinnedAt == nil || !gotRoom.PinnedAt.Equal(*before.PinnedAt) {
+		t.Errorf("เลขห้อง pinned_at = %v, want restored to %v", gotRoom.PinnedAt, before.PinnedAt)
+	}
+}
