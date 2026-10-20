@@ -669,44 +669,6 @@ func TestPinNotesPicksExactTitleAndRecordsPreviousState(t *testing.T) {
 	}
 }
 
-func TestPickPinTarget(t *testing.T) {
-	str := func(s string) *string { return &s }
-	at := testNow
-	n := func(id, content string, pinned, done bool) *note.Note {
-		x := &note.Note{ID: id, Content: str(content), IsDone: done}
-		if pinned {
-			x.PinnedAt = &at
-		}
-		return x
-	}
-	cases := []struct {
-		name    string
-		matches []*note.Note
-		query   string
-		pinned  bool
-		wantID  string
-	}{
-		{"none", nil, "x", true, ""},
-		{"single partial match", []*note.Note{n("a", "ซื้อของเข้าบ้าน", false, false)}, "ซื้อของ", true, "a"},
-		{"exact title wins", []*note.Note{n("a", "ซื้อของขวัญ", false, false), n("b", "ซื้อของ", false, false)}, "ซื้อของ", true, "b"},
-		{"two partial matches", []*note.Note{n("a", "ประชุมทีม", false, false), n("b", "ประชุมลูกค้า", false, false)}, "ประชุม", true, ""},
-		{"unpin the only pinned one", []*note.Note{n("a", "ประชุมทีม", false, false), n("b", "ประชุมลูกค้า", true, false)}, "ประชุม", false, "b"},
-		{"skip done when pinning", []*note.Note{n("a", "ซื้อของ 1", false, true), n("b", "ซื้อของ 2", false, false)}, "ซื้อของ", true, "b"},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			got, ok := pickPinTarget(tc.matches, tc.query, tc.pinned)
-			gotID := ""
-			if ok {
-				gotID = got.ID
-			}
-			if gotID != tc.wantID {
-				t.Errorf("pickPinTarget = %q, want %q", gotID, tc.wantID)
-			}
-		})
-	}
-}
-
 func TestListPinnedShowsOnlyPinned(t *testing.T) {
 	store := newFakeStore()
 	str := func(s string) *string { return &s }

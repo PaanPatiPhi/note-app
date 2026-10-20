@@ -583,7 +583,7 @@ func (e *executor) pinNotes(ctx context.Context, queries []string, pinned bool) 
 		if err != nil {
 			return nil, err
 		}
-		best, ok := pickPinTarget(matches, q, pinned)
+		best, ok := note.PickPinTarget(matches, q, pinned)
 		if !ok {
 			if len(matches) == 0 {
 				notFound = append(notFound, q)
@@ -621,41 +621,6 @@ func (e *executor) pinNotes(ctx context.Context, queries []string, pinned bool) 
 		result["not_found"] = notFound
 	}
 	return result, nil
-}
-
-// pickPinTarget เลือกโน้ตที่แน่ใจจากผลค้นหา (เรียงใหม่ → เก่า):
-// เจอตัวเดียว, ชื่อตรงเป๊ะตัวเดียว, หรือมีตัวเดียวที่ยังไม่อยู่ในสถานะที่ต้องการ
-// (ตอนปักจะข้ามโน้ตที่ทำเสร็จแล้ว)
-func pickPinTarget(matches []*note.Note, query string, pinned bool) (*note.Note, bool) {
-	if len(matches) == 0 {
-		return nil, false
-	}
-	if len(matches) == 1 {
-		return matches[0], true
-	}
-	var exact []*note.Note
-	for _, m := range matches {
-		if strings.EqualFold(strings.TrimSpace(noteContent(m)), query) {
-			exact = append(exact, m)
-		}
-	}
-	if len(exact) == 1 {
-		return exact[0], true
-	}
-	pool := matches
-	if len(exact) > 1 {
-		pool = exact
-	}
-	var pending []*note.Note
-	for _, m := range pool {
-		if (m.PinnedAt != nil) != pinned && !(pinned && m.IsDone) {
-			pending = append(pending, m)
-		}
-	}
-	if len(pending) == 1 {
-		return pending[0], true
-	}
-	return nil, false
 }
 
 func noteContent(n *note.Note) string {

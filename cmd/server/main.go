@@ -84,7 +84,7 @@ func main() {
 		lineAI = ai
 	}
 	webhookHandler := note.NewHandler(noteService, bot, channelSecret, lineAI)
-	assistantAPIHandler := assistant.NewAPIHandler(ai)
+	assistantAPIHandler := assistant.NewAPIHandler(ai).WithFallback(noteService)
 	noteAPIHandler := note.NewAPIHandler(noteService)
 	userAPIHandler := user.NewAPIHandler(userRepo)
 	authHandler := auth.NewHandler(userRepo, liffChannelID)

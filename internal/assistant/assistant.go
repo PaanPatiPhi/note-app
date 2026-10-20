@@ -4,7 +4,6 @@ package assistant
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -161,7 +160,7 @@ func (a *Assistant) Handle(ctx context.Context, req Request) (*Result, error) {
 }
 
 func (a *Assistant) run(ctx context.Context, req Request, exec *executor, action *Action, now time.Time) (string, error) {
-	if isPinnedQuestion(req.Text) {
+	if note.IsPinnedQuestion(req.Text) {
 		return a.answerPinned(ctx, exec, action)
 	}
 
@@ -230,19 +229,6 @@ func (a *Assistant) run(ctx context.Context, req Request, exec *executor, action
 		}
 	}
 	return fallbackReply, fmt.Errorf("no final reply after %d rounds", maxRounds)
-}
-
-// answerPinned ตอบ "ปักอะไรไว้บ้าง" จาก DB ตรงๆ (ดู isPinnedQuestion) — บันทึกเป็น tool call ใน ai_actions เหมือนปกติ
-func (a *Assistant) answerPinned(ctx context.Context, exec *executor, action *Action) (string, error) {
-	toolStart := time.Now()
-	run := a.runTool(ctx, exec, ToolCall{ID: "direct", Name: "list_pinned", Input: json.RawMessage(`{"kind":"all"}`)})
-	action.timing.tools += time.Since(toolStart)
-	action.ToolCalls = append(action.ToolCalls, run)
-	if run.IsError {
-		return fallbackReply, errors.New("list pinned notes: " + run.Error)
-	}
-	views, _ := run.Result.(map[string]any)["notes"].([]noteView)
-	return pinnedReply(views), nil
 }
 
 func (a *Assistant) runTool(ctx context.Context, exec *executor, call ToolCall) toolRun {

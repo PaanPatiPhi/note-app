@@ -130,19 +130,40 @@ func (s *Service) CaptureFromLine(ctx context.Context, lineUserID, displayName, 
 	if err != nil {
 		return nil, fmt.Errorf("find or create user: %w", err)
 	}
+	return s.captureFor(ctx, u.ID, text, NoteSourceLine)
+}
 
+// captureFor คือคำสั่งแบบไม่ใช้ AI ทั้งหมด (source = ช่องทางที่บันทึกโน้ตใหม่)
+func (s *Service) captureFor(ctx context.Context, userID, text string, source NoteSource) (*CommandResult, error) {
 	trimmed := strings.TrimSpace(text)
+
+	if IsPinnedQuestion(trimmed) {
+		return s.listPinned(ctx, userID)
+	}
+	if query, pinned, ok := parsePinCommand(trimmed); ok {
+		res, found, err := s.pinByQuery(ctx, userID, query, pinned)
+		if err != nil {
+			return nil, err
+		}
+		if found {
+			return res, nil
+		}
+		if !pinned {
+			return &CommandResult{Action: "pin_not_found", Query: query}, nil
+		}
+		// "ปัก..." ที่หาโน้ตไม่เจอ (เช่น "ปักเต็นท์ที่เขาใหญ่") จดเป็นโน้ตตามปกติ
+	}
 
 	switch {
 	case trimmed == deleteKeyword:
-		return s.deleteLatest(ctx, u.ID)
+		return s.deleteLatest(ctx, userID)
 
 	case strings.HasPrefix(trimmed, editPrefix):
 		newContent := strings.TrimSpace(strings.TrimPrefix(trimmed, editPrefix))
 		if result := validateOrResult(newContent); result != nil {
 			return result, nil
 		}
-		return s.editLatest(ctx, u.ID, newContent)
+		return s.editLatest(ctx, userID, newContent)
 
 	case strings.HasPrefix(trimmed, completeItemPrefix):
 		posStr := strings.TrimSpace(strings.TrimPrefix(trimmed, completeItemPrefix))
@@ -150,26 +171,26 @@ func (s *Service) CaptureFromLine(ctx context.Context, lineUserID, displayName, 
 		if err != nil || pos < 1 {
 			return &CommandResult{Action: "invalid_content", Message: `พิมพ์ "เสร็จ" ตามด้วยเลขลำดับ เช่น "เสร็จ 2"`}, nil
 		}
-		return s.completeLatestChecklistItem(ctx, u.ID, pos)
+		return s.completeLatestChecklistItem(ctx, userID, pos)
 
 	case strings.HasSuffix(trimmed, fuzzyDoneSuffix) && trimmed != fuzzyDoneSuffix:
 		query := strings.TrimSpace(strings.TrimSuffix(trimmed, fuzzyDoneSuffix))
-		return s.fuzzyToggleItem(ctx, u.ID, query, true)
+		return s.fuzzyToggleItem(ctx, userID, query, true)
 
 	case strings.HasSuffix(trimmed, fuzzyUndoneSuffix) && trimmed != fuzzyUndoneSuffix:
 		query := strings.TrimSpace(strings.TrimSuffix(trimmed, fuzzyUndoneSuffix))
-		return s.fuzzyToggleItem(ctx, u.ID, query, false)
+		return s.fuzzyToggleItem(ctx, userID, query, false)
 
 	case strings.HasPrefix(trimmed, searchPrefix):
 		query := strings.TrimSpace(strings.TrimPrefix(trimmed, searchPrefix))
 		if result := validateOrResult(query); result != nil {
 			return result, nil
 		}
-		return s.searchNotes(ctx, u.ID, query)
+		return s.searchNotes(ctx, userID, query)
 
 	case trimmed == viewChecklistKeyword || trimmed == viewChecklistTodayWord:
 		t := NoteTypeChecklist
-		return s.viewByDate(ctx, u.ID, time.Now().In(bangkok), &t)
+		return s.viewByDate(ctx, userID, time.Now().In(bangkok), &t)
 
 	case strings.HasPrefix(trimmed, viewChecklistPrefix):
 		dateStr := strings.TrimSpace(strings.TrimPrefix(trimmed, viewChecklistPrefix))
@@ -178,11 +199,11 @@ func (s *Service) CaptureFromLine(ctx context.Context, lineUserID, displayName, 
 			return &CommandResult{Action: "invalid_date"}, nil
 		}
 		t := NoteTypeChecklist
-		return s.viewByDate(ctx, u.ID, date, &t)
+		return s.viewByDate(ctx, userID, date, &t)
 
 	case trimmed == viewNoteKeyword || trimmed == viewNoteTodayWord:
 		t := NoteTypeNote
-		return s.viewByDate(ctx, u.ID, time.Now().In(bangkok), &t)
+		return s.viewByDate(ctx, userID, time.Now().In(bangkok), &t)
 
 	case strings.HasPrefix(trimmed, viewNotePrefix):
 		dateStr := strings.TrimSpace(strings.TrimPrefix(trimmed, viewNotePrefix))
@@ -191,10 +212,10 @@ func (s *Service) CaptureFromLine(ctx context.Context, lineUserID, displayName, 
 			return &CommandResult{Action: "invalid_date"}, nil
 		}
 		t := NoteTypeNote
-		return s.viewByDate(ctx, u.ID, date, &t)
+		return s.viewByDate(ctx, userID, date, &t)
 
 	case trimmed == viewKeyword || trimmed == viewTodayWord:
-		return s.viewByDate(ctx, u.ID, time.Now().In(bangkok), nil)
+		return s.viewByDate(ctx, userID, time.Now().In(bangkok), nil)
 
 	case strings.HasPrefix(trimmed, viewPrefix):
 		dateStr := strings.TrimSpace(strings.TrimPrefix(trimmed, viewPrefix))
@@ -202,14 +223,14 @@ func (s *Service) CaptureFromLine(ctx context.Context, lineUserID, displayName, 
 		if err != nil {
 			return &CommandResult{Action: "invalid_date"}, nil
 		}
-		return s.viewByDate(ctx, u.ID, date, nil)
+		return s.viewByDate(ctx, userID, date, nil)
 
 	case isChecklist(trimmed):
 		title, items := splitChecklist(trimmed)
 		if result := validateOrResult(title); result != nil {
 			return result, nil
 		}
-		n, err := s.noteRepo.SaveChecklist(ctx, u.ID, &title, items, NoteSourceLine)
+		n, err := s.noteRepo.SaveChecklist(ctx, userID, &title, items, source)
 		if err != nil {
 			return nil, fmt.Errorf("save checklist: %w", err)
 		}
@@ -219,7 +240,7 @@ func (s *Service) CaptureFromLine(ctx context.Context, lineUserID, displayName, 
 		if result := validateOrResult(trimmed); result != nil {
 			return result, nil
 		}
-		n := &Note{UserID: u.ID, Content: &trimmed, Type: NoteTypeNote, Source: NoteSourceLine}
+		n := &Note{UserID: userID, Content: &trimmed, Type: NoteTypeNote, Source: source}
 		if err := s.noteRepo.SaveNote(ctx, n); err != nil {
 			return nil, fmt.Errorf("save note: %w", err)
 		}
@@ -337,7 +358,8 @@ func splitChecklist(text string) (title string, items []string) {
 	if idx == -1 {
 		title = trimmed
 	} else {
-		title = strings.TrimSpace(trimmed[:idx])
+		// "ซื้อของ, นม, ไข่" → ชื่อ "ซื้อของ" (ไม่เอาคอมมา/โคลอนที่พิมพ์ติดชื่อมา)
+		title = strings.TrimRight(strings.TrimSpace(trimmed[:idx]), ",:")
 		rest = trimmed[idx+1:]
 	}
 	for _, p := range strings.Split(rest, ",") {

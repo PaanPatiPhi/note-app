@@ -7,26 +7,6 @@ import (
 	"jodjod/internal/note"
 )
 
-func TestIsPinnedQuestion(t *testing.T) {
-	cases := map[string]bool{
-		"ตอนนี้ปักอะไรไว้บ้าง":          true,
-		"มีอะไรอยู่บน widget บ้าง":      true,
-		"ปักอะไรไว้":                    true,
-		"ปักลิสต์อะไรไว้บ้าง":           true,
-		"บนวิดเจ็ตมีอะไร":               true,
-		"ปักลิสต์ซื้อของไว้":            false,
-		"เอาอะไรออกจาก widget บ้าง":     false,
-		"เลิกปักอะไรได้บ้าง":            false,
-		"ซื้ออะไรบ้าง":                  false,
-		"จดลิสต์ซื้อของ แล้วปักไว้ด้วย": false,
-	}
-	for text, want := range cases {
-		if got := isPinnedQuestion(text); got != want {
-			t.Errorf("isPinnedQuestion(%q) = %v, want %v", text, got, want)
-		}
-	}
-}
-
 func TestPinnedQuestionAnswersWithoutModel(t *testing.T) {
 	store := newFakeStore()
 	str := func(s string) *string { return &s }
@@ -56,11 +36,5 @@ func TestPinnedQuestionAnswersWithoutModel(t *testing.T) {
 	}
 	if calls := actions.saved[0].ToolCalls; len(calls) != 1 || calls[0].Name != "list_pinned" {
 		t.Errorf("logged tool calls = %+v, want one list_pinned", calls)
-	}
-}
-
-func TestPinnedReplyEmpty(t *testing.T) {
-	if got := pinnedReply(nil); !strings.Contains(got, "ยังไม่ได้ปักอะไร") {
-		t.Errorf("pinnedReply(nil) = %q", got)
 	}
 }

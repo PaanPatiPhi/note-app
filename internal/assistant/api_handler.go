@@ -10,6 +10,8 @@ import (
 	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
+
+	"jodjod/internal/note"
 )
 
 // เว็บ/แอปรอได้นานกว่า LINE (ไม่มี reply token หมดอายุ) แต่ไม่ควรค้างนานเกินไป
@@ -18,11 +20,23 @@ const apiTimeout = 30 * time.Second
 // APIHandler เปิด assistant ให้เว็บและแอปใช้ได้โดยไม่ผ่าน LINE
 // ต้องอยู่หลัง auth middleware (ใช้ "user_id" จาก context เสมอ ไม่รับ user จาก body)
 type APIHandler struct {
-	ai *Assistant
+	ai       *Assistant
+	fallback Fallback
+}
+
+// Fallback คือคำสั่งแบบไม่ใช้ AI (note.Service) ใช้ตอน AI ปิดอยู่หรือล่ม ข้อความจะได้ไม่หาย
+type Fallback interface {
+	CaptureForUser(ctx context.Context, userID, text string) (*note.CommandResult, error)
 }
 
 func NewAPIHandler(ai *Assistant) *APIHandler {
 	return &APIHandler{ai: ai}
+}
+
+// WithFallback ให้หน้าแชทบนเว็บใช้คำสั่งแบบเดิมแทนเมื่อ AI ใช้ไม่ได้ (เหมือนใน LINE)
+func (h *APIHandler) WithFallback(f Fallback) *APIHandler {
+	h.fallback = f
+	return h
 }
 
 func (h *APIHandler) RegisterRoutes(rg *gin.RouterGroup) {
@@ -51,11 +65,6 @@ func (h *APIHandler) message(c *gin.Context) {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
 		return
 	}
-	if h.ai == nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "assistant is disabled"})
-		return
-	}
-
 	var req messageRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
@@ -71,13 +80,22 @@ func (h *APIHandler) message(c *gin.Context) {
 		return
 	}
 
+	if h.ai == nil {
+		if !h.replyWithFallback(c, userID, text, false) {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "assistant is disabled"})
+		}
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(c.Request.Context(), apiTimeout)
 	defer cancel()
 	res, err := h.ai.Handle(ctx, Request{UserID: userID, Text: text})
 	if err != nil {
-		// error = ยังไม่ได้เขียนข้อมูลใดเลย (เช่น Ollama ไม่ได้เปิด) ผู้ใช้ลองใหม่ได้ปลอดภัย
-		log.Println("assistant API ล้มเหลว:", err)
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "assistant unavailable", "reply": fallbackReply})
+		// error = ยังไม่ได้เขียนข้อมูลใดเลย (เช่น Ollama ไม่ได้เปิด) ใช้คำสั่งแบบเดิมแทนได้ปลอดภัย
+		log.Println("assistant API ล้มเหลว ใช้คำสั่งแบบเดิมแทน:", err)
+		if !h.replyWithFallback(c, userID, text, true) {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "assistant unavailable", "reply": fallbackReply})
+		}
 		return
 	}
 
@@ -87,6 +105,25 @@ func (h *APIHandler) message(c *gin.Context) {
 		Undoable: res.Wrote && res.ActionID != "",
 		Wrote:    res.Wrote,
 	})
+}
+
+// replyWithFallback ตอบด้วยคำสั่งแบบไม่ใช้ AI; false = ไม่มี fallback หรือ fallback เองก็ล้ม (ผู้เรียกตอบ 503)
+// aiDown = AI ควรตอบได้แต่ล่ม → บอกผู้ใช้ด้วยถ้าข้อความถูกจดเป็นโน้ตธรรมดา
+func (h *APIHandler) replyWithFallback(c *gin.Context, userID, text string, aiDown bool) bool {
+	if h.fallback == nil {
+		return false
+	}
+	res, err := h.fallback.CaptureForUser(c.Request.Context(), userID, text)
+	if err != nil {
+		log.Println("คำสั่งแบบเดิมล้มเหลว:", err)
+		return false
+	}
+	reply := note.ReplyText(res)
+	if aiDown && res.Action == "created" {
+		reply += "\n" + note.AIDownHint
+	}
+	c.JSON(http.StatusOK, messageResponse{Reply: reply, Wrote: res.Wrote()})
+	return true
 }
 
 // undo: POST /api/assistant/actions/:id/undo

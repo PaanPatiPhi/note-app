@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+
+	"jodjod/internal/note"
 )
 
 // newTestRouter ต่อ APIHandler หลัง middleware จำลองที่ใส่ user_id (แทน auth.RequireAuth)
@@ -189,5 +191,42 @@ func TestAPIHistory(t *testing.T) {
 	}
 	if w := doJSON(newTestRouter(NewAPIHandler(a), ""), http.MethodGet, "/api/assistant/history", ""); w.Code != http.StatusUnauthorized {
 		t.Errorf("no auth: status = %d, want 401", w.Code)
+	}
+}
+
+type fallbackStub struct {
+	res     *note.CommandResult
+	gotUser string
+	gotText string
+}
+
+func (f *fallbackStub) CaptureForUser(_ context.Context, userID, text string) (*note.CommandResult, error) {
+	f.gotUser, f.gotText = userID, text
+	return f.res, nil
+}
+
+func TestAPIMessageFallsBackWhenModelDown(t *testing.T) {
+	llm := &fakeLLM{responses: []string{textMsg("x")}, errAt: 1}
+	a, _ := newTestAssistant(llm, newFakeStore())
+	fb := &fallbackStub{res: &note.CommandResult{Action: "created", Note: &note.Note{Type: note.NoteTypeNote}}}
+
+	w := doJSON(newTestRouter(NewAPIHandler(a).WithFallback(fb), "u"), http.MethodPost, "/api/assistant/messages", `{"text":"เตือนจ่ายค่าเน็ตพรุ่งนี้"}`)
+	var body messageResponse
+	_ = json.Unmarshal(w.Body.Bytes(), &body)
+	if w.Code != http.StatusOK || !body.Wrote || !strings.Contains(body.Reply, "จดแล้ว") || !strings.Contains(body.Reply, note.AIDownHint) {
+		t.Fatalf("status = %d body = %s, want 200, saved as a note, with the AI-down hint", w.Code, w.Body)
+	}
+	if fb.gotUser != "u" || fb.gotText != "เตือนจ่ายค่าเน็ตพรุ่งนี้" {
+		t.Errorf("fallback got user %q text %q", fb.gotUser, fb.gotText)
+	}
+}
+
+func TestAPIMessageFallsBackWhenAIOff(t *testing.T) {
+	fb := &fallbackStub{res: &note.CommandResult{Action: "pinned_list"}}
+	w := doJSON(newTestRouter(NewAPIHandler(nil).WithFallback(fb), "u"), http.MethodPost, "/api/assistant/messages", `{"text":"ปักอะไรไว้บ้าง"}`)
+	var body messageResponse
+	_ = json.Unmarshal(w.Body.Bytes(), &body)
+	if w.Code != http.StatusOK || body.Wrote || !strings.Contains(body.Reply, "ยังไม่ได้ปักอะไร") || strings.Contains(body.Reply, note.AIDownHint) {
+		t.Errorf("status = %d body = %s, want 200 with the pinned list and no AI-down hint", w.Code, w.Body)
 	}
 }

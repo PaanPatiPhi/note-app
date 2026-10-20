@@ -180,8 +180,8 @@ func (h *Handler) handleMessageEvent(ctx context.Context, msgEvent webhook.Messa
 	}
 
 	// คำสั่งแบบเดิม (ดู/ลบ/เสร็จ 2/หา ...) ตอบทันทีไม่ต้องใช้ AI; ข้อความอื่นให้ AI ลองก่อน
-	if h.ai != nil && !IsCommand(textMsg.Text) &&
-		h.handleWithAI(ctx, source.UserId, msgEvent.WebhookEventId, msgEvent.ReplyToken, textMsg.Text) {
+	triedAI := h.ai != nil && !IsCommand(textMsg.Text)
+	if triedAI && h.handleWithAI(ctx, source.UserId, msgEvent.WebhookEventId, msgEvent.ReplyToken, textMsg.Text) {
 		return
 	}
 
@@ -197,7 +197,12 @@ func (h *Handler) handleMessageEvent(ctx context.Context, msgEvent webhook.Messa
 		return
 	}
 
-	h.reply(ctx, msgEvent.ReplyToken, replyTextFor(result))
+	reply := replyTextFor(result)
+	if triedAI && result.Action == "created" {
+		// AI ล่ม/ช้าเกินไป จึงจดเป็นโน้ตธรรมดา: บอกผู้ใช้ว่ายังไม่ได้ตั้งเตือนหรือลงนัด
+		reply += "\n" + AIDownHint
+	}
+	h.reply(ctx, msgEvent.ReplyToken, reply)
 }
 
 // handleWithAI ส่งข้อความให้ AI แล้วตอบกลับ คืน false ถ้า AI ใช้ไม่ได้และยังไม่ได้เขียนข้อมูล
@@ -363,6 +368,20 @@ func replyTextFor(result *CommandResult) string {
 		return formatNoteList(result.Notes, result.NoteItems, formatDateHeader(result.Date))
 	case "searched":
 		return formatNoteList(result.Notes, result.NoteItems, fmt.Sprintf(`ผลค้นหา "%s"`, result.Query))
+	case "pinned_list":
+		return FormatPinned(result.Notes, result.NoteItems)
+	case "pinned":
+		return fmt.Sprintf("📌 ปัก \"%s\" ไว้บน widget แล้วครับ", contentOf(result.Note))
+	case "unpinned":
+		return fmt.Sprintf("📌 เอา \"%s\" ออกจาก widget แล้วครับ", contentOf(result.Note))
+	case "pin_not_found":
+		return fmt.Sprintf("ไม่เจอโน้ตที่ชื่อ \"%s\" ครับ", result.Query)
+	case "pin_ambiguous":
+		names := make([]string, 0, len(result.Notes))
+		for _, n := range result.Notes {
+			names = append(names, contentOf(n))
+		}
+		return fmt.Sprintf("เจอหลายอันที่มีคำว่า \"%s\" ครับ: %s\nพิมพ์ชื่อให้ตรงขึ้นอีกนิด เช่น \"ปัก %s\"", result.Query, strings.Join(names, ", "), names[0])
 	case "created":
 		if result.Note != nil && result.Note.Type == NoteTypeChecklist {
 			return "บันทึกลิสต์แล้ว ✅"
