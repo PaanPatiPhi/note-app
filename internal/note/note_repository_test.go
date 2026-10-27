@@ -243,3 +243,45 @@ func TestPinnedFeed(t *testing.T) {
 		t.Error("SetPinned by another user succeeded, want error")
 	}
 }
+
+func TestClaimDueReminders(t *testing.T) {
+	pool := getTestPool(t)
+	ctx := context.Background()
+	repo := NewRepository(pool)
+	userID := createTestUser(t, pool)
+	lineID := "U-test-claim-" + userID
+	if _, err := pool.Exec(ctx, `INSERT INTO user_identities (user_id, provider, provider_user_id, display_name) VALUES ($1, 'line', $2, 'jodjod-test-note-repo')`, userID, lineID); err != nil {
+		t.Fatal(err)
+	}
+
+	// ใช้เวลาในอดีตไกลๆ ไม่ให้ชนกับ reminder จริงที่ถึงเวลาพร้อมกัน
+	now := time.Date(2001, 1, 1, 12, 0, 0, 0, bangkok)
+	save := func(text string, at time.Time, done bool) *Note {
+		n := &Note{UserID: userID, Content: &text, Type: NoteTypeReminder, RemindAt: &at, IsDone: done, Source: NoteSourceAI}
+		if err := repo.SaveNote(ctx, n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	due := save("ถึงเวลาแล้ว", now.Add(-time.Minute), false)
+	save("ยังไม่ถึง", now.Add(time.Hour), false)
+	save("ทำไปแล้ว", now.Add(-time.Minute), true)
+
+	got, err := repo.ClaimDueReminders(ctx, now, 50)
+	if err != nil {
+		t.Fatalf("ClaimDueReminders: %v", err)
+	}
+	if len(got) != 1 || got[0].NoteID != due.ID || got[0].LineUserID != lineID || got[0].Content != "ถึงเวลาแล้ว" || !got[0].RemindAt.Equal(*due.RemindAt) {
+		t.Fatalf("claimed %+v, want only %s with LINE id %s", got, due.ID, lineID)
+	}
+	if again, _ := repo.ClaimDueReminders(ctx, now, 50); len(again) != 0 {
+		t.Errorf("second claim = %+v, want nothing (already claimed)", again)
+	}
+
+	if err := repo.ReleaseReminder(ctx, due.ID); err != nil {
+		t.Fatal(err)
+	}
+	if again, _ := repo.ClaimDueReminders(ctx, now, 50); len(again) != 1 || again[0].NoteID != due.ID {
+		t.Errorf("claim after release = %+v, want %s again", again, due.ID)
+	}
+}

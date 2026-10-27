@@ -588,3 +588,56 @@ func (r *Repository) FindAgenda(ctx context.Context, userID string, from, to tim
 	defer rows.Close()
 	return scanNotes(rows)
 }
+
+// DueReminder คือ reminder ที่ถึงเวลาส่งแล้ว พร้อม LINE user id ของเจ้าของ (ว่าง = ไม่ได้เชื่อม LINE)
+type DueReminder struct {
+	NoteID     string
+	UserID     string
+	LineUserID string
+	Content    string
+	RemindAt   time.Time
+}
+
+// ClaimDueReminders จอง reminder ที่ถึงเวลา (remind_at <= now) และยังไม่ได้ส่ง โดยตั้ง reminded_at ทันที
+// FOR UPDATE SKIP LOCKED + เงื่อนไข reminded_at IS NULL ทำให้รันหลาย instance พร้อมกันก็ไม่ส่งซ้ำ
+// ส่งไม่สำเร็จแบบชั่วคราวให้เรียก ReleaseReminder เพื่อลองใหม่รอบถัดไป
+func (r *Repository) ClaimDueReminders(ctx context.Context, now time.Time, limit int) ([]DueReminder, error) {
+	rows, err := r.pool.Query(ctx, `
+		WITH due AS (
+			SELECT id FROM notes
+			WHERE type = 'reminder' AND remind_at <= $1 AND reminded_at IS NULL AND NOT is_done
+			ORDER BY remind_at
+			LIMIT $2
+			FOR UPDATE SKIP LOCKED
+		)
+		UPDATE notes n SET reminded_at = now()
+		FROM due
+		WHERE n.id = due.id AND n.reminded_at IS NULL
+		RETURNING n.id, n.user_id, coalesce(n.content, ''), n.remind_at,
+			coalesce((SELECT ui.provider_user_id FROM user_identities ui
+				WHERE ui.user_id = n.user_id AND ui.provider = 'line'
+				ORDER BY ui.created_at LIMIT 1), '')
+	`, now, limit)
+	if err != nil {
+		return nil, fmt.Errorf("claim due reminders: %w", err)
+	}
+	defer rows.Close()
+
+	var due []DueReminder
+	for rows.Next() {
+		var d DueReminder
+		if err := rows.Scan(&d.NoteID, &d.UserID, &d.Content, &d.RemindAt, &d.LineUserID); err != nil {
+			return nil, fmt.Errorf("scan due reminder: %w", err)
+		}
+		due = append(due, d)
+	}
+	return due, rows.Err()
+}
+
+// ReleaseReminder คืนสถานะ "ยังไม่ได้ส่ง" ให้ reminder ที่จองไว้แต่ส่งไม่สำเร็จ
+func (r *Repository) ReleaseReminder(ctx context.Context, noteID string) error {
+	if _, err := r.pool.Exec(ctx, `UPDATE notes SET reminded_at = NULL WHERE id = $1`, noteID); err != nil {
+		return fmt.Errorf("release reminder: %w", err)
+	}
+	return nil
+}

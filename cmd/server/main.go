@@ -26,6 +26,7 @@ import (
 	"jodjod/internal/integrations"
 	"jodjod/internal/note"
 	"jodjod/internal/ratelimit"
+	"jodjod/internal/reminder"
 	"jodjod/internal/subscription"
 	"jodjod/internal/user"
 )
@@ -93,6 +94,16 @@ func main() {
 	subscriptionRepo := subscription.NewRepository(pool)
 	subscriptionHandler := subscription.NewHandler(subscriptionRepo, userRepo)
 	adminHandler := admin.NewHandler(userRepo, feedbackRepo, subscriptionRepo, noteRepo)
+
+	// ส่ง reminder ที่ถึงเวลาทาง LINE ทุกนาที
+	// REMINDER_PUSH=off ปิดได้ เช่นเครื่อง dev ตอนที่มี server บน cloud ส่งอยู่แล้ว (เปิดคู่กันก็ไม่ส่งซ้ำ แต่ไม่จำเป็น)
+	reminderCtx, stopReminders := context.WithCancel(ctx)
+	defer stopReminders()
+	if strings.EqualFold(strings.TrimSpace(os.Getenv("REMINDER_PUSH")), "off") {
+		log.Println("reminder: ปิดการส่งเตือน (REMINDER_PUSH=off)")
+	} else {
+		go reminder.New(noteRepo, reminder.NewLinePusher(bot)).Run(reminderCtx)
+	}
 
 	r := gin.Default()
 	production := os.Getenv("ENV") == "production"
@@ -192,6 +203,7 @@ func main() {
 	defer stop()
 	<-sigCtx.Done()
 	log.Println("กำลังปิด server...")
+	stopReminders()
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
